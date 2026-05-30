@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Academic Review Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@500;650&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Application status">
+        <div>
+          <p class="eyebrow">Academic Review MVP</p>
+          <h1>Chat, upload, and get structured feedback.</h1>
+        </div>
+        <div class="top-controls">
+          <label class="model-switch" for="modelSelect">
+            <span>Model</span>
+            <select id="modelSelect">
+              <option value="deepseek-r1:8b">DeepSeek R1 8B</option>
+              <option value="gemma3:1b">Gemma 3 1B</option>
+              <option value="groq:llama-3.1-8b-instant">Groq Llama 3.1 8B Instant</option>
+            </select>
+          </label>
+          <label class="model-switch" for="formatSelect">
+            <span>Format Mode</span>
+            <select id="formatSelect">
+              <option value="general">General Review</option>
+              <option value="apa7">APA 7</option>
+              <option value="ieee">IEEE</option>
+            </select>
+          </label>
+          <div class="status-pill" id="healthStatus">Checking API...</div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="chat-panel" aria-label="Intake chat">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Step 1</p>
+              <h2>Intake Chat</h2>
+            </div>
+            <button class="ghost-button" id="resetBtn" type="button">Reset</button>
+          </div>
+
+          <div class="messages" id="messages" aria-live="polite"></div>
+
+          <form class="composer" id="chatForm">
+            <input
+              id="chatInput"
+              type="text"
+              autocomplete="off"
+              placeholder="Paste text or ask for review..."
+              required
+            />
+            <button type="submit">Send</button>
+          </form>
+        </aside>
+
+        <section class="review-panel" aria-label="Document review">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Step 2</p>
+              <h2>Review Draft</h2>
+            </div>
+            <div class="tabs" role="tablist" aria-label="Input mode">
+              <button class="tab active" id="textTab" type="button">Text</button>
+              <button class="tab" id="docxTab" type="button">DOCX</button>
+            </div>
+          </div>
+
+          <form class="analysis-form" id="textForm">
+            <textarea
+              id="draftText"
+              placeholder="Paste your academic draft here..."
+              minlength="20"
+            ></textarea>
+            <div class="action-row">
+              <button class="primary-action" type="submit">Analyze Text</button>
+              <button class="secondary-action" id="fixIeeeTextBtn" type="button">Fix IEEE Format</button>
+            </div>
+          </form>
+
+          <form class="analysis-form hidden" id="docxForm">
+            <label class="file-drop">
+              <span id="fileLabel">Choose a .docx file</span>
+              <input id="docxFile" type="file" accept=".docx" required />
+            </label>
+            <div class="action-row">
+              <button class="primary-action" type="submit">Analyze DOCX</button>
+              <button class="secondary-action" id="fixIeeeDocxBtn" type="button">Fix IEEE Format</button>
+            </div>
+          </form>
+
+          <div class="result-state" id="resultState">
+            <span class="mark">Ready</span>
+            <p>Paste text into chat or use the review panel.</p>
+          </div>
+
+          <div class="thinking hidden" id="thinkingStatus" aria-live="polite">
+            <div class="pulse-bars" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <div>
+              <span class="mark" id="thinkingStep">Reading draft</span>
+              <p id="thinkingDetail">Preparing the academic review.</p>
+            </div>
+          </div>
+
+          <div class="results hidden" id="results"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
