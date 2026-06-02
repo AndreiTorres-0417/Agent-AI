@@ -137,12 +137,11 @@ h3 {
   display: grid;
   grid-template-columns: minmax(320px, 0.85fr) minmax(0, 1.45fr);
   gap: 18px;
-  align-items: stretch;
+  align-items: start;
 }
 
 .chat-panel,
 .review-panel {
-  min-height: 680px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255, 253, 247, 0.86);
@@ -153,6 +152,15 @@ h3 {
 .chat-panel {
   display: flex;
   flex-direction: column;
+  height: clamp(420px, 68vh, 560px);
+  align-self: start;
+  position: sticky;
+  top: 18px;
+}
+
+.review-panel {
+  align-self: start;
+  min-height: 680px;
 }
 
 .panel-header {
@@ -192,6 +200,7 @@ h3 {
   flex: 1;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
   overflow: auto;
   padding: 18px;
 }
@@ -218,6 +227,32 @@ h3 {
 .message.error {
   border-color: rgba(159, 47, 47, 0.3);
   color: var(--danger);
+}
+
+.message p {
+  margin: 0 0 9px;
+}
+
+.message p:last-child {
+  margin-bottom: 0;
+}
+
+.message .chat-list {
+  margin: 8px 0 10px;
+  padding-left: 22px;
+}
+
+.message .chat-list-depth-1 {
+  margin-left: 16px;
+}
+
+.message .chat-list-depth-2 {
+  margin-left: 32px;
+}
+
+.message li {
+  margin: 5px 0;
+  padding-left: 2px;
 }
 
 .composer {
@@ -543,9 +578,14 @@ textarea:focus {
     margin-top: 0;
   }
 
-  .chat-panel,
   .review-panel {
+    margin-bottom: 16px;
     min-height: 560px;
+  }
+
+  .chat-panel {
+    position: static;
+    height: 480px;
     margin-bottom: 16px;
   }
 

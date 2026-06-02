@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import re
@@ -13,7 +13,10 @@ from fastapi.responses import FileResponse
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("academic-review-mvp")
@@ -40,8 +43,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="Client-provided chat session ID")
     message: str = Field(..., min_length=1, description="Latest user message")
-    model: Optional[str] = Field(None, description="Optional Ollama model override")
-    format_mode: Optional[str] = Field("general", description="Review style: general, apa7, or ieee")
+    model: Optional[str] = Field(None, description="Academic assistant model: OpenAI or local Gemma")
 
 
 class ChatResponse(BaseModel):
@@ -55,9 +57,11 @@ class ChatResponse(BaseModel):
 
 class AnalyzeTextRequest(BaseModel):
     text: str = Field(..., min_length=20)
+    session_id: Optional[str] = Field(None, description="Chat session that should receive the paper context")
     metadata: Optional[Dict[str, Any]] = None
-    model: Optional[str] = Field(None, description="Optional Ollama model override")
-    format_mode: Optional[str] = Field("general", description="Review style: general, apa7, or ieee")
+    model: Optional[str] = Field(None, description="Document analysis model: OpenAI or local Gemma")
+    review_mode: Optional[str] = Field("format", description="Review mode: format or academic")
+    format_mode: Optional[str] = Field("apa7", description="Compliance style: apa7 or ieee")
 
 
 class AnalyzeTextStreamRequest(AnalyzeTextRequest):
@@ -133,14 +137,6 @@ class AnalysisResponse(BaseModel):
     fallback_used: bool
 
 
-INTAKE_QUESTIONS = [
-    "What is your course or discipline?",
-    "What assignment type is this (essay, report, literature review, etc.)?",
-    "What citation style is required (APA, MLA, Chicago, Harvard, other)?",
-    "What grading criteria or rubric should I prioritize?",
-    "Do you want strict critique only, or critique plus rewrite suggestions?",
-]
-
 chat_sessions: Dict[str, Dict[str, Any]] = {}
 
 
@@ -149,16 +145,13 @@ def index() -> FileResponse:
     return FileResponse("static/index.html")
 
 
-def get_ollama_url() -> str:
-    return os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+ALLOWED_MODELS = {"openai:gpt-4.1-mini", "gemma3:1b"}
+ALLOWED_REVIEW_MODES = {"format", "academic"}
+ALLOWED_FORMAT_MODES = {"apa7", "ieee"}
 
 
-ALLOWED_MODELS = {"deepseek-r1:8b", "gemma3:1b", "groq:llama-3.1-8b-instant"}
-ALLOWED_FORMAT_MODES = {"general", "apa7", "ieee"}
-
-
-def get_ollama_model(model_override: Optional[str] = None) -> str:
-    model = model_override or os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
+def get_analysis_model(model_override: Optional[str] = None) -> str:
+    model = model_override or os.getenv("ANALYSIS_MODEL", "openai:gpt-4.1-mini")
     if model not in ALLOWED_MODELS:
         raise HTTPException(
             status_code=400,
@@ -167,27 +160,108 @@ def get_ollama_model(model_override: Optional[str] = None) -> str:
     return model
 
 
-def is_groq_model(model: str) -> bool:
-    return model.startswith("groq:")
+def get_ollama_url() -> str:
+    return os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
-def groq_model_id(model: str) -> str:
-    return model.removeprefix("groq:")
+def is_openai_model(model: str) -> bool:
+    return model.startswith("openai:")
 
 
-def get_groq_api_key() -> str:
-    key = os.getenv("GROQ_API_KEY", "").strip()
+def openai_model_id(model: str) -> str:
+    return model.removeprefix("openai:")
+
+
+def get_openai_api_key() -> str:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("GROQ_API_KEY is not configured. Add it to .env to use Groq hosted models.")
+        raise RuntimeError("OPENAI_API_KEY is not configured. Add it to .env to use OpenAI hosted models.")
     return key
 
 
+ACADEMIC_ASSISTANT_PROMPT = """
+You are an academic-paper assistant. Help students plan, improve, and understand academic papers.
+Provide practical guidance for outlines, thesis statements, section organization, literature synthesis,
+citations, references, tables, figures, revisions, and APA 7 or IEEE compliance.
+Do not invent sources, quotations, data, DOI values, or page numbers. State clearly when a source or fact
+must be verified. Do not write an entire submit-ready paper for the student; help them reason, revise, and
+produce their own work.
+
+Keep responses concise and direct. For greetings or broad requests for help, reply with a short description
+of what you can help with and ask the user to share their paper, question, or goal. Do not start with a
+questionnaire or a numbered list of intake questions. Ask at most one focused follow-up question when the
+user's specific request cannot be answered without clarification. Do not use emojis or excessive encouragement.
+""".strip()
+
+
+def call_assistant_chat(
+    messages: List[Dict[str, str]],
+    model_override: Optional[str] = None,
+    paper_context: Optional[str] = None,
+) -> str:
+    model = model_override or os.getenv("OPENAI_CHAT_MODEL", "openai:gpt-4.1-mini")
+    if model not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported model '{model}'. Choose one of: {', '.join(sorted(ALLOWED_MODELS))}.",
+        )
+    system_prompt = ACADEMIC_ASSISTANT_PROMPT
+    if paper_context:
+        system_prompt += (
+            "\n\nThe user has analyzed a paper in Step 2. Use the following paper context when answering "
+            "follow-up questions. Do not claim details beyond this context:\n" + paper_context
+        )
+    chat_messages = [{"role": "system", "content": system_prompt}, *messages]
+    if not is_openai_model(model):
+        resp = requests.post(
+            f"{get_ollama_url()}/api/chat",
+            json={
+                "model": model,
+                "messages": chat_messages,
+                "stream": False,
+                "options": {"temperature": 0.3},
+            },
+            timeout=90,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {resp.text.strip()}")
+        return resp.json()["message"]["content"].strip()
+
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {get_openai_api_key()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": openai_model_id(model),
+            "messages": chat_messages,
+            "temperature": 0.3,
+            "max_tokens": 900,
+        },
+        timeout=90,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI request failed with HTTP {resp.status_code}: {resp.text.strip()}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 def normalize_format_mode(format_mode: Optional[str] = None) -> str:
-    mode = (format_mode or "general").lower()
+    mode = (format_mode or "apa7").lower()
     if mode not in ALLOWED_FORMAT_MODES:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported format mode '{format_mode}'. Choose one of: {', '.join(sorted(ALLOWED_FORMAT_MODES))}.",
+        )
+    return mode
+
+
+def normalize_review_mode(review_mode: Optional[str] = None) -> str:
+    mode = (review_mode or "format").lower()
+    if mode not in ALLOWED_REVIEW_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported review mode '{review_mode}'. Choose one of: {', '.join(sorted(ALLOWED_REVIEW_MODES))}.",
         )
     return mode
 
@@ -736,7 +810,7 @@ def ieee_format_text(text: str) -> Dict[str, Any]:
                     "IEEE citation issues",
                 )
             stripped_ref = re.sub(r"^\[\d+\]\s*", "", lines[idx]).strip()
-            has_title_quotes = bool(re.search(r"[\"“”].+[\"“”]", stripped_ref))
+            has_title_quotes = bool(re.search(r"[\"â€œâ€].+[\"â€œâ€]", stripped_ref))
             looks_like_article = bool(re.search(r"\b(journal|proceedings|conference|transactions|vol\.|no\.|pp\.)\b", stripped_ref, re.IGNORECASE))
             year_present = bool(re.search(r"\b(19|20)\d{2}\b", stripped_ref))
             has_publication_detail = bool(
@@ -907,81 +981,34 @@ def extract_docx_text(file_bytes: bytes) -> str:
         raise HTTPException(status_code=400, detail=f"Failed to parse .docx: {exc}") from exc
 
 
-def fallback_analysis(text: str, reason: str, format_mode: str = "general") -> Dict[str, Any]:
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    word_count = len(re.findall(r"\b\w+\b", text))
-    has_citation_like = bool(re.search(r"\([A-Za-z]+,\s*\d{4}\)|\[[0-9]+\]", text))
-    causal_language = bool(
-        re.search(
-            r"\b(impact|influence|effect|affect|determine|directly affects|causes?|leads to)\b",
-            text,
-            re.IGNORECASE,
-        )
-    )
-    gap_asserted = bool(re.search(r"\b(limited understanding|gap|despite|however|therefore)\b", text, re.IGNORECASE))
-
+def fallback_analysis(
+    text: str,
+    reason: str,
+    review_mode: str = "format",
+    format_mode: str = "apa7",
+) -> Dict[str, Any]:
+    review_mode = normalize_review_mode(review_mode)
+    format_mode = normalize_format_mode(format_mode)
+    if review_mode == "academic":
+        return {
+            "summary": f"General academic review could not use the selected AI model ({reason}). Retry when the model is available.",
+            "structure_format_issues": [],
+            "academic_quality_issues": [],
+            "citation_consistency_issues": [],
+            "prioritized_suggestions": [],
+            "optional_rewrite_suggestions": [],
+            "highlights": [],
+            "reviewed_text": text,
+            "source": "fallback",
+            "fallback_used": True,
+        }
     data = {
-        "summary": f"Fallback analysis used because LLM was unavailable ({reason}). "
-        f"Text appears to have about {word_count} words and {len(paragraphs)} non-empty paragraphs.",
-        "structure_format_issues": [
-            {
-                "issue": "Paragraph organization may be weak",
-                "severity": "medium",
-                "evidence": f"Detected {len(paragraphs)} non-empty paragraphs; manual review needed for section flow.",
-                "recommendation": "Add clear introduction, body sections with topic sentences, and a conclusion.",
-            }
-        ],
-        "academic_quality_issues": [
-            {
-                "issue": "Possible causal overclaiming" if causal_language else "Argument strength requires manual review",
-                "severity": "high" if causal_language else "medium",
-                "evidence": "The draft uses causal language such as impact, influence, affect, or determine."
-                if causal_language
-                else "Fallback mode cannot fully verify thesis-evidence alignment.",
-                "recommendation": "If the study is not experimental or longitudinal, revise causal claims into association language such as 'relationship between' or 'is associated with.'"
-                if causal_language
-                else "Make sure each major claim is supported by evidence and explicit reasoning.",
-            },
-            {
-                "issue": "Research gap may be asserted rather than demonstrated",
-                "severity": "high" if gap_asserted else "medium",
-                "evidence": "The draft appears to claim a gap using phrases like limited understanding, despite, however, or therefore."
-                if gap_asserted
-                else "No clear evidence summary was detected in fallback mode.",
-                "recommendation": "Briefly summarize what prior studies found, identify the specific unresolved point, explain why it matters, and state how this study addresses it.",
-            },
-        ],
-        "citation_consistency_issues": [
-            {
-                "issue": "Citation presence appears limited or inconsistent"
-                if not has_citation_like
-                else "Citation style consistency not verifiable in fallback mode",
-                "severity": "high" if not has_citation_like else "medium",
-                "evidence": "No obvious in-text citations detected." if not has_citation_like else "Some citation-like patterns detected.",
-                "recommendation": "Apply one citation style consistently and verify references match in-text citations.",
-            }
-        ],
-        "prioritized_suggestions": [
-            {
-                "priority": "high",
-                "suggestion": "Align the claim strength with the likely research design.",
-                "rationale": "Academic panels often challenge causal words when the method can only support correlation or association.",
-                "expected_impact": "Reduces a major validity objection before defense or grading.",
-            },
-            {
-                "priority": "high",
-                "suggestion": "Make the research gap evidence-based.",
-                "rationale": "A gap statement is weak if it is only asserted and not grounded in prior findings.",
-                "expected_impact": "Creates a stronger justification for the study.",
-            },
-        ],
-        "optional_rewrite_suggestions": [
-            {
-                "original_excerpt": "This essay talks about many things.",
-                "rewritten_excerpt": "This study examines the relationship between social media use and academic performance among college students.",
-                "reason": "Uses association language instead of unsupported causal language.",
-            }
-        ],
+        "summary": f"{format_mode.upper()} compliance review completed with deterministic checks because the model was unavailable ({reason}).",
+        "structure_format_issues": [],
+        "academic_quality_issues": [],
+        "citation_consistency_issues": [],
+        "prioritized_suggestions": [],
+        "optional_rewrite_suggestions": [],
         "highlights": [],
         "reviewed_text": text,
         "source": "fallback",
@@ -990,197 +1017,248 @@ def fallback_analysis(text: str, reason: str, format_mode: str = "general") -> D
     return merge_deterministic_findings(data, text, format_mode=format_mode)
 
 
-def deterministic_findings(text: str, format_mode: str = "general") -> Dict[str, List[Dict[str, str]]]:
-    academic_quality: List[Dict[str, str]] = []
+def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, List[Dict[str, str]]]:
+    format_mode = normalize_format_mode(format_mode)
+    structure_issues: List[Dict[str, str]] = []
     citation_issues: List[Dict[str, str]] = []
     suggestions: List[Dict[str, str]] = []
-    rewrites: List[Dict[str, str]] = []
     highlights: List[Dict[str, str]] = []
 
-    causal_match = re.search(
-        r"\b(determine the impact|direct(?:ly)? affects?|impact|influence|effect|affects?|causes?)\b",
-        text,
-        re.IGNORECASE,
-    )
-    design_support = re.search(
-        r"\b(experiment|experimental|random(?:ized)?|control group|longitudinal|causal design)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if causal_match and not design_support:
-        academic_quality.append(
+    def add_issue(
+        target: List[Dict[str, str]],
+        issue: str,
+        evidence: str,
+        recommendation: str,
+        excerpt: str = "",
+        severity: str = "medium",
+    ) -> None:
+        target.append(
             {
-                "issue": "Causal claim is stronger than the apparent study design supports",
-                "severity": "high",
-                "evidence": f"The draft uses causal wording such as '{causal_match.group(0)}' without describing a causal research design.",
-                "recommendation": "Use association language unless the methodology can establish causation.",
+                "issue": issue,
+                "severity": severity,
+                "evidence": evidence,
+                "recommendation": recommendation,
             }
         )
-        suggestions.append(
-            {
-                "priority": "high",
-                "suggestion": "Replace causal framing with relationship/correlation framing.",
-                "rationale": "A panelist can challenge causal language if the study only observes social media use and grades.",
-                "expected_impact": "Improves methodological accuracy and reduces a major defense risk.",
-            }
-        )
-        rewrites.append(
-            {
-                "original_excerpt": causal_match.group(0),
-                "rewritten_excerpt": "examine the relationship between social media usage and academic performance",
-                "reason": "This wording avoids claiming causation before the research design supports it.",
-            }
-        )
-        highlights.append(
-            {
-                "excerpt": causal_match.group(0),
-                "message": "This causal wording may be too strong unless your method can prove cause and effect.",
-                "severity": "high",
-                "category": "causal claim",
-            }
-        )
-
-    gap_match = re.search(r"\b(limited understanding|research gap|gap)\b", text, re.IGNORECASE)
-    study_claims = re.findall(r"\b(recent studies|researchers argue|studies indicate|research suggests)\b", text, re.IGNORECASE)
-    citation_like = re.findall(r"\([A-Za-z][A-Za-z\s&.-]*,\s*\d{4}\)|\[[0-9]+\]", text)
-    if gap_match and len(study_claims) < 3:
-        academic_quality.append(
-            {
-                "issue": "Research gap is asserted rather than demonstrated",
-                "severity": "high",
-                "evidence": f"The draft says '{gap_match.group(0)}' but does not clearly synthesize prior findings to prove the gap.",
-                "recommendation": "Add a brief literature progression: what is known, what remains unresolved, why it matters, and how this study responds.",
-            }
-        )
-        suggestions.append(
-            {
-                "priority": "high",
-                "suggestion": "Rebuild the gap paragraph around specific prior findings.",
-                "rationale": "A justified gap is stronger than a general claim that understanding is limited.",
-                "expected_impact": "Makes the study rationale more defensible.",
-            }
-        )
-        highlights.append(
-            {
-                "excerpt": gap_match.group(0),
-                "message": "This gap is asserted; strengthen it by showing what prior studies have not resolved.",
-                "severity": "high",
-                "category": "research gap",
-            }
-        )
-
-    if study_claims and not citation_like:
-        first_claim = re.search(
-            r"\b(recent studies have suggested|recent studies|some researchers argue|researchers argue|studies indicate|research suggests)\b",
-            text,
-            re.IGNORECASE,
-        )
-        citation_issues.append(
-            {
-                "issue": "Literature claims need citations",
-                "severity": "high",
-                "evidence": f"The draft refers to {', '.join(sorted(set(study_claims), key=str.lower))} but includes no visible in-text citations.",
-                "recommendation": "Add citations for each claim about prior research and make sure every in-text citation appears in the reference list.",
-            }
-        )
-        if first_claim:
+        if excerpt:
             highlights.append(
                 {
-                    "excerpt": first_claim.group(0),
-                    "message": "This claim refers to prior research but is not cited properly.",
-                    "severity": "high",
-                    "category": "citation",
+                    "excerpt": excerpt,
+                    "message": recommendation,
+                    "severity": severity,
+                    "category": f"{format_mode.upper()} compliance",
                 }
             )
 
-    apa_citations = re.findall(r"\([A-Za-z][A-Za-z\s&.-]*,\s*\d{4}[a-z]?\)", text)
-    ieee_citations = re.findall(r"\[[0-9]+(?:,\s*[0-9]+|-+[0-9]+)?\]", text)
-    has_reference_heading = bool(re.search(r"(?im)^\s*(references|reference list|works cited)\s*$", text))
+    lines = text.splitlines()
+    has_references_heading = bool(re.search(r"(?im)^\s*references\s*$", text))
+    wrong_reference_heading = re.search(r"(?im)^\s*(bibliography|works cited|reference list)\s*$", text)
+    apa_citations = re.findall(r"\([A-Z][A-Za-z' -]+(?:\s+et al\.)?,\s*\d{4}[a-z]?\)", text)
+    apa_citations.extend(re.findall(r"\b[A-Z][A-Za-z'-]+\s+\(\d{4}[a-z]?\)", text))
+    ieee_citations = re.findall(r"\[(\d+)\]", text)
+    figure_lines = [line.strip() for line in lines if re.match(r"(?i)^\s*(fig(?:ure)?\.?)\s*\d+", line)]
+    table_lines = [line.strip() for line in lines if re.match(r"(?i)^\s*table\s+[A-Z0-9IVX]+", line)]
+
+    if wrong_reference_heading:
+        add_issue(
+            citation_issues,
+            "Reference section heading is not compliant",
+            f"Detected heading '{wrong_reference_heading.group(1)}'.",
+            "Rename the section heading to 'References'.",
+            wrong_reference_heading.group(0).strip(),
+        )
+    elif not has_references_heading:
+        add_issue(
+            citation_issues,
+            "References section is not visible",
+            "No standalone 'References' heading was detected.",
+            "Add a References section and verify that every in-text citation has a matching entry.",
+        )
 
     if format_mode == "apa7":
-        if ieee_citations and not apa_citations:
-            citation_issues.append(
-                {
-                    "issue": "IEEE-style numeric citations do not match APA 7 format",
-                    "severity": "high",
-                    "evidence": f"Detected numeric citation marker '{ieee_citations[0]}'.",
-                    "recommendation": "Use APA 7 author-date citations such as (Smith, 2023) and a References section.",
-                }
+        if ieee_citations:
+            marker = f"[{ieee_citations[0]}]"
+            add_issue(
+                citation_issues,
+                "Numeric bracket citation violates APA 7",
+                f"Detected IEEE-style marker '{marker}'.",
+                "Use an APA 7 author-date citation such as (Smith, 2024).",
+                marker,
+                "high",
             )
-            highlights.append(
-                {
-                    "excerpt": ieee_citations[0],
-                    "message": "APA 7 uses author-date citations, not numeric bracket citations.",
-                    "severity": "high",
-                    "category": "APA 7 format",
-                }
+        ampersand_citation = re.search(r"\([A-Z][A-Za-z' -]+\s+and\s+[A-Z][A-Za-z' -]+,\s*\d{4}\)", text)
+        if ampersand_citation:
+            add_issue(
+                citation_issues,
+                "Parenthetical APA 7 citation should use an ampersand",
+                f"Detected '{ampersand_citation.group(0)}'.",
+                "Use '&' between author names inside a parenthetical citation.",
+                ampersand_citation.group(0),
             )
-        if study_claims and not apa_citations:
-            citation_issues.append(
-                {
-                    "issue": "APA 7 requires author-date citations for research claims",
-                    "severity": "high",
-                    "evidence": "The text discusses prior studies but no APA-style author-date citation is visible.",
-                    "recommendation": "Add citations like (Author, Year) or Author (Year) for each research claim.",
-                }
+        reference_lines: List[str] = []
+        in_references = False
+        for line in lines:
+            if re.match(r"(?i)^\s*references\s*$", line):
+                in_references = True
+                continue
+            if in_references and line.strip():
+                reference_lines.append(line.strip())
+        numbered_reference = next((line for line in reference_lines if re.match(r"^\[\d+\]", line)), "")
+        if numbered_reference:
+            add_issue(
+                citation_issues,
+                "Numbered reference entry violates APA 7",
+                f"Detected '{numbered_reference[:100]}'.",
+                "Remove bracketed reference numbers. APA 7 reference entries are alphabetized by author surname.",
+                numbered_reference[:100],
+                "high",
             )
-        if not has_reference_heading:
-            citation_issues.append(
-                {
-                    "issue": "APA 7 reference section is not visible",
-                    "severity": "medium",
-                    "evidence": "No clear References heading was detected.",
-                    "recommendation": "Include a References section if this is a complete paper draft.",
-                }
+        initials_first_reference = next(
+            (line for line in reference_lines if re.match(r"^(?:\[\d+\]\s*)?[A-Z]\.\s+[A-Z][A-Za-z'-]+,", line)),
+            "",
+        )
+        if initials_first_reference:
+            add_issue(
+                citation_issues,
+                "Reference author name order does not follow APA 7",
+                f"Detected '{initials_first_reference[:100]}'.",
+                "Use surname first followed by initials, for example 'Smith, J.'.",
+                initials_first_reference[:100],
+            )
+        surnames = [
+            match.group(1).lower()
+            for line in reference_lines
+            if (match := re.match(r"^(?:\[\d+\]\s*)?([A-Z][A-Za-z'-]+),", line))
+        ]
+        if len(surnames) > 1 and surnames != sorted(surnames):
+            add_issue(
+                citation_issues,
+                "APA 7 reference entries are not alphabetized",
+                f"Detected leading author surnames in this order: {surnames}.",
+                "Alphabetize reference entries by the surname of the first author.",
+            )
+        cited_surnames = {
+            match.lower()
+            for match in re.findall(r"\(([A-Z][A-Za-z'-]+)(?:\s+et al\.)?,\s*\d{4}[a-z]?\)", text)
+        }
+        missing_surnames = sorted(cited_surnames - set(surnames))
+        if missing_surnames and has_references_heading:
+            add_issue(
+                citation_issues,
+                "APA 7 in-text citation has no visible matching reference entry",
+                f"No surname-first reference entry was found for: {missing_surnames}.",
+                "Add the missing reference entries or correct the in-text citations.",
+                severity="high",
+            )
+        for line in figure_lines:
+            if re.match(r"(?i)^fig\.", line) or re.match(r"(?i)^figure\s+\d+\s*[:.-]", line):
+                add_issue(
+                    structure_issues,
+                    "Figure label does not follow APA 7 naming",
+                    f"Detected '{line}'.",
+                    "Use 'Figure 1' on its own line, followed by the italicized figure title on the next line.",
+                    line,
+                )
+        for line in table_lines:
+            if re.match(r"(?i)^table\s+\d+\s*[:.-]", line) or re.match(r"(?i)^table\s+[IVX]+\b", line):
+                add_issue(
+                    structure_issues,
+                    "Table label does not follow APA 7 naming",
+                    f"Detected '{line}'.",
+                    "Use an Arabic-number label such as 'Table 1' on its own line, followed by the italicized title.",
+                    line,
+                )
+    else:
+        if apa_citations:
+            add_issue(
+                citation_issues,
+                "Author-date citation violates IEEE style",
+                f"Detected APA-style citation '{apa_citations[0]}'.",
+                "Use a numbered IEEE citation such as [1].",
+                apa_citations[0],
+                "high",
+            )
+        for line in figure_lines:
+            if not re.match(r"^Fig\.\s*\d+\.\s+\S", line):
+                add_issue(
+                    structure_issues,
+                    "Figure caption does not follow IEEE naming",
+                    f"Detected '{line}'.",
+                    "Use an IEEE caption such as 'Fig. 1. Caption text.' below the figure.",
+                    line,
+                )
+        for line in table_lines:
+            if not re.match(r"^TABLE\s+[IVX]+\b", line):
+                add_issue(
+                    structure_issues,
+                    "Table caption does not follow IEEE naming",
+                    f"Detected '{line}'.",
+                    "Use an uppercase Roman-numeral table label such as 'TABLE I' above the table.",
+                    line,
+                )
+
+        reference_numbers: List[int] = []
+        in_references = False
+        unnumbered_reference = ""
+        for line in lines:
+            if re.match(r"(?i)^\s*references\s*$", line):
+                in_references = True
+                continue
+            if not in_references or not line.strip():
+                continue
+            match = re.match(r"^\s*\[(\d+)\]", line)
+            if match:
+                reference_numbers.append(int(match.group(1)))
+            elif not unnumbered_reference:
+                unnumbered_reference = line.strip()
+        if unnumbered_reference:
+            add_issue(
+                citation_issues,
+                "IEEE reference entry is missing a bracketed number",
+                f"Detected unnumbered reference entry '{unnumbered_reference[:100]}'.",
+                "Number each IEEE reference entry in citation order, for example '[1] ...'.",
+                unnumbered_reference[:100],
+                "high",
+            )
+        if reference_numbers and reference_numbers != list(range(1, len(reference_numbers) + 1)):
+            add_issue(
+                citation_issues,
+                "IEEE reference entries are not sequentially numbered",
+                f"Detected reference numbers {reference_numbers}.",
+                "Number references sequentially in order of first citation: [1], [2], [3], and so on.",
+                severity="high",
+            )
+        missing_entries = sorted(set(int(value) for value in ieee_citations) - set(reference_numbers))
+        if missing_entries and has_references_heading:
+            add_issue(
+                citation_issues,
+                "IEEE in-text citation has no matching reference entry",
+                f"No matching reference entry was found for {missing_entries}.",
+                "Add the missing numbered entries or correct the in-text citation numbers.",
+                severity="high",
             )
 
-    if format_mode == "ieee":
-        if apa_citations and not ieee_citations:
-            citation_issues.append(
-                {
-                    "issue": "APA-style author-date citations do not match IEEE format",
-                    "severity": "high",
-                    "evidence": f"Detected author-date citation '{apa_citations[0]}'.",
-                    "recommendation": "Use IEEE numeric citations such as [1] and list references in numerical order.",
-                }
-            )
-            highlights.append(
-                {
-                    "excerpt": apa_citations[0],
-                    "message": "IEEE uses numbered bracket citations, not author-date citations.",
-                    "severity": "high",
-                    "category": "IEEE format",
-                }
-            )
-        if study_claims and not ieee_citations:
-            citation_issues.append(
-                {
-                    "issue": "IEEE requires numbered citations for research claims",
-                    "severity": "high",
-                    "evidence": "The text discusses prior studies but no IEEE-style numeric citation is visible.",
-                    "recommendation": "Add citations like [1] near each research claim and order references numerically.",
-                }
-            )
-        if not has_reference_heading:
-            citation_issues.append(
-                {
-                    "issue": "IEEE references section is not visible",
-                    "severity": "medium",
-                    "evidence": "No clear References heading was detected.",
-                    "recommendation": "Include a References section with entries numbered to match in-text citations.",
-                }
-            )
+    for item in (citation_issues + structure_issues)[:5]:
+        suggestions.append(
+            {
+                "priority": item["severity"],
+                "suggestion": item["recommendation"],
+                "rationale": item["evidence"],
+                "expected_impact": f"Resolves a detected {format_mode.upper()} compliance violation.",
+            }
+        )
 
     return {
-        "academic_quality_issues": academic_quality,
+        "structure_format_issues": structure_issues,
+        "academic_quality_issues": [],
         "citation_consistency_issues": citation_issues,
         "prioritized_suggestions": suggestions,
-        "optional_rewrite_suggestions": rewrites,
+        "optional_rewrite_suggestions": [],
         "highlights": highlights,
     }
 
 
-def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: str = "general") -> Dict[str, Any]:
+def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: str = "apa7") -> Dict[str, Any]:
     findings = deterministic_findings(text, format_mode=format_mode)
     for field, items in findings.items():
         existing = data.get(field, [])
@@ -1200,7 +1278,13 @@ def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: s
     return data
 
 
-def coerce_analysis_shape(data: Dict[str, Any], text: str, format_mode: str = "general") -> Dict[str, Any]:
+def coerce_analysis_shape(
+    data: Dict[str, Any],
+    text: str,
+    review_mode: str = "format",
+    format_mode: str = "apa7",
+) -> Dict[str, Any]:
+    review_mode = normalize_review_mode(review_mode)
     required_list_fields = [
         "structure_format_issues",
         "academic_quality_issues",
@@ -1214,24 +1298,91 @@ def coerce_analysis_shape(data: Dict[str, Any], text: str, format_mode: str = "g
     for field in required_list_fields:
         if field not in data or not isinstance(data[field], list):
             data[field] = []
-    data["source"] = "ollama"
+    issue_fields = [
+        "structure_format_issues",
+        "academic_quality_issues",
+        "citation_consistency_issues",
+    ]
+    for field in issue_fields:
+        data[field] = [
+            item
+            for item in data[field]
+            if isinstance(item, dict)
+            and str(item.get("issue", "")).strip()
+            and str(item.get("evidence") or item.get("recommendation") or "").strip()
+        ]
+    data["prioritized_suggestions"] = [
+        item
+        for item in data["prioritized_suggestions"]
+        if isinstance(item, dict)
+        and str(item.get("suggestion", "")).strip()
+        and str(item.get("rationale") or item.get("expected_impact") or "").strip()
+    ]
+    data["optional_rewrite_suggestions"] = [
+        item
+        for item in data["optional_rewrite_suggestions"]
+        if isinstance(item, dict)
+        and str(item.get("original_excerpt", "")).strip()
+        and str(item.get("rewritten_excerpt", "")).strip()
+    ]
+    data["highlights"] = [
+        item
+        for item in data["highlights"]
+        if isinstance(item, dict)
+        and str(item.get("excerpt", "")).strip()
+        and str(item.get("message", "")).strip()
+    ]
+    data["source"] = "openai"
     data["fallback_used"] = False
     data["reviewed_text"] = text
 
-    if not data["prioritized_suggestions"]:
-        data["prioritized_suggestions"] = fallback_analysis(text, "empty suggestions", format_mode=format_mode)["prioritized_suggestions"]
-    return merge_deterministic_findings(data, text, format_mode=format_mode)
+    if review_mode == "format":
+        data["academic_quality_issues"] = []
+        data["optional_rewrite_suggestions"] = []
+        return merge_deterministic_findings(data, text, format_mode=format_mode)
+    return data
 
 
 def build_analysis_prompt(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
-    format_mode: str = "general",
+    review_mode: str = "format",
+    format_mode: str = "apa7",
 ) -> str:
-    style_label = {"general": "General academic review", "apa7": "APA 7", "ieee": "IEEE"}[format_mode]
+    review_mode = normalize_review_mode(review_mode)
+    if review_mode == "academic":
+        return f"""
+You are a rigorous academic writing reviewer. Review the submitted paper for writing quality and academic effectiveness.
+Return ONLY valid JSON, no markdown.
+JSON keys required:
+- summary (string)
+- structure_format_issues (array of objects: issue, severity, evidence, recommendation)
+- academic_quality_issues (array of objects: issue, severity, evidence, recommendation)
+- citation_consistency_issues (array of objects: issue, severity, evidence, recommendation)
+- prioritized_suggestions (array of objects: priority, suggestion, rationale, expected_impact)
+- optional_rewrite_suggestions (array of objects: original_excerpt, rewritten_excerpt, reason)
+- highlights (array of objects: excerpt, message, severity, category)
+
+Review priorities:
+- Explain how the paper sounds: clarity, academic tone, flow, coherence, concision, and precision.
+- Flag grammar, sentence construction, awkward wording, informal language, vague claims, repetition, and weak word choice.
+- Flag claims that appear to need citations, including factual assertions, statistics, attributed ideas, and broad research claims.
+- Identify organization problems such as weak transitions, unclear thesis, unsupported claims, or paragraphs without a clear purpose.
+- Suggest focused rewrites only for the clearest high-value examples.
+- Every issue must include concrete evidence copied or closely identified from the paper.
+- Do not invent sources, facts, quotations, or paper requirements.
+- Prefer fewer useful findings over generic filler. Keep the summary under 120 words.
+
+Context metadata:
+{json.dumps(metadata or {}, ensure_ascii=True)}
+
+Text to review:
+{text}
+"""
+    style_label = {"apa7": "APA 7", "ieee": "IEEE"}[format_mode]
     return f"""
-You are a strict academic panel reviewer for student research papers.
-Selected review format: {style_label}.
+You are a strict {style_label} document-compliance reviewer.
+Analyze only violations of the selected style. Do not critique the argument, research quality, methodology, or writing quality.
 Return ONLY valid JSON, no markdown.
 JSON keys required:
 - summary (string)
@@ -1243,43 +1394,27 @@ JSON keys required:
 - highlights (array of objects: excerpt, message, severity, category)
 
 Constraints:
-- Focus on high-value critique a thesis/research panelist would actually raise.
-- Do not invent weak issues just to fill categories.
-- Prefer fewer, stronger issues over many generic comments.
+- Report only concrete {style_label} violations visible in the submitted text.
+- Check formatting conventions, in-text citations, references, citation/reference matching, table naming, and figure naming.
+- Do not invent issues just to fill categories.
 - Every issue must cite concrete evidence from the draft.
 - If a category has no meaningful issue, return an empty array for that category.
-- Severity must reflect academic risk: high, medium, or low.
+- academic_quality_issues must always be an empty array.
+- optional_rewrite_suggestions must always be an empty array.
+- Severity must reflect compliance risk: high, medium, or low.
 - Keep summary under 100 words.
 
-Reviewer priorities:
-1. Causal overclaiming:
-   - Flag words such as "impact", "influence", "effect", "affects", "directly affects", "determine", or "causes" when the text does not establish an experimental, longitudinal, or otherwise causal design.
-   - Recommend association/correlation wording when causality is unsupported.
-2. Research gap quality:
-   - Check whether the gap is demonstrated or merely asserted.
-   - A weak gap says "limited understanding" without summarizing prior findings, identifying the specific unresolved point, explaining why it matters, and stating how this study addresses it.
-3. Literature support:
-   - Flag missing citations where the introduction makes claims about "recent studies", "researchers argue", or broad scholarly findings.
-   - Do not treat missing citations as the deepest issue if a stronger conceptual issue exists.
-4. Format mode:
-   - If selected format is APA 7, check for author-date in-text citations, References heading, citation/reference consistency, and APA-style academic formatting risks.
-   - If selected format is IEEE, check for numbered bracket citations like [1], numerical reference ordering, References heading, and citation/reference consistency.
-   - If selected format is General academic review, do not enforce APA 7 or IEEE-specific rules.
-4. Scope and specificity:
-   - Flag vague scope only when it affects research design clarity, such as unclear population, variables, grade measure, or social media usage measure.
-5. Avoid low-value filler:
-   - Do not criticize ordinary words like "distraction" unless the term is central to the research variables and needs operational definition.
-   - Do not claim terminology inconsistency unless genuinely different concepts are being mixed.
-   - Do not penalize repeated words unless repetition creates real ambiguity.
+Style requirements:
+- APA 7 uses author-date in-text citations, the heading "References", Arabic-number labels such as "Table 1" and "Figure 1", and APA table/figure title placement.
+- IEEE uses bracketed numeric in-text citations such as [1], references numbered in citation order, the heading "References", figure captions such as "Fig. 1. Caption", and uppercase Roman-numeral table labels such as "TABLE I".
+- Flag mixed citation systems and malformed or unmatched references when visible.
 
 Output expectations:
-- academic_quality_issues should include the strongest conceptual problems first.
-- citation_consistency_issues should focus on missing source support and citation/reference matching.
-- prioritized_suggestions should rank the most important fixes, not restate every minor issue.
-- optional_rewrite_suggestions should rewrite only the riskiest sentence(s), especially causal claims or weak gap statements.
+- structure_format_issues should contain formatting, table, and figure violations.
+- citation_consistency_issues should contain citation and reference violations.
+- prioritized_suggestions should rank the most important compliance fixes.
 - highlights should contain exact short excerpts copied from the text that deserve inline marking.
-- highlight messages should be concise hover text, for example: "This claim needs a citation."
-- Only highlight meaningful problems; do not highlight harmless wording.
+- highlight messages should be concise hover text.
 
 Context metadata:
 {json.dumps(metadata or {}, ensure_ascii=True)}
@@ -1289,193 +1424,100 @@ Text to review:
 """
 
 
-def parse_ollama_analysis(raw: str, text: str, format_mode: str = "general") -> Dict[str, Any]:
+def parse_model_analysis(
+    raw: str,
+    text: str,
+    review_mode: str = "format",
+    format_mode: str = "apa7",
+) -> Dict[str, Any]:
     if not raw:
-        raise ValueError("Empty response from Ollama.")
+        raise ValueError("Empty response from selected model.")
     data = json.loads(raw)
     if not isinstance(data, dict):
-        raise ValueError("Ollama output is not a JSON object.")
-    return coerce_analysis_shape(data, text, format_mode=format_mode)
+        raise ValueError("Selected model output is not a JSON object.")
+    return coerce_analysis_shape(data, text, review_mode=review_mode, format_mode=format_mode)
 
 
-def call_ollama_for_analysis(
-    text: str,
-    metadata: Optional[Dict[str, Any]] = None,
-    model_override: Optional[str] = None,
-    format_mode: str = "general",
-) -> Dict[str, Any]:
-    model = get_ollama_model(model_override)
-    format_mode = normalize_format_mode(format_mode)
-    prompt = build_analysis_prompt(text=text, metadata=metadata, format_mode=format_mode)
-
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.2},
-    }
-    url = f"{get_ollama_url()}/api/generate"
-
-    resp = requests.post(url, json=body, timeout=90)
+def repair_ollama_json(raw: str, model: str) -> str:
+    resp = requests.post(
+        f"{get_ollama_url()}/api/generate",
+        json={
+            "model": model,
+            "prompt": (
+                "Repair the JSON syntax in the text below. Preserve the existing meaning and keys. "
+                "Return ONLY one valid JSON object with no markdown or explanation.\n\n"
+                f"{raw}"
+            ),
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0},
+        },
+        timeout=90,
+    )
     if resp.status_code >= 400:
-        detail = resp.text.strip()
-        if resp.status_code == 404:
-            raise RuntimeError(
-                f"Ollama returned 404. The model '{model}' may not be installed, "
-                f"or OLLAMA_URL may not point to Ollama. Response: {detail}"
-            )
-        raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {detail}")
-    payload = resp.json()
-    raw = payload.get("response", "").strip()
-    return parse_ollama_analysis(raw=raw, text=text, format_mode=format_mode)
+        raise RuntimeError(f"Ollama JSON repair failed with HTTP {resp.status_code}: {resp.text.strip()}")
+    return resp.json().get("response", "").strip()
 
 
-def analyze_text_with_resilience(
+def parse_analysis_with_local_repair(
+    raw: str,
     text: str,
-    metadata: Optional[Dict[str, Any]] = None,
-    model_override: Optional[str] = None,
-    format_mode: str = "general",
+    model: str,
+    review_mode: str,
+    format_mode: str,
 ) -> Dict[str, Any]:
     try:
-        return call_ollama_for_analysis(
-            text=text,
-            metadata=metadata,
-            model_override=model_override,
-            format_mode=format_mode,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Ollama analysis failed")
-        return fallback_analysis(text=text, reason=str(exc), format_mode=format_mode)
+        return parse_model_analysis(raw=raw, text=text, review_mode=review_mode, format_mode=format_mode)
+    except json.JSONDecodeError:
+        repaired = repair_ollama_json(raw=raw, model=model)
+        return parse_model_analysis(raw=repaired, text=text, review_mode=review_mode, format_mode=format_mode)
 
 
 def json_line(event: str, payload: Dict[str, Any]) -> str:
     return json.dumps({"event": event, **payload}, ensure_ascii=True) + "\n"
 
 
-def analysis_event_stream(
+def remember_paper_context(
+    session_id: Optional[str],
     text: str,
-    metadata: Optional[Dict[str, Any]] = None,
-    model_override: Optional[str] = None,
-    format_mode: str = "general",
-) -> Generator[str, None, None]:
-    try:
-        model = get_ollama_model(model_override)
-        format_mode = normalize_format_mode(format_mode)
-        yield json_line(
-            "status",
-            {
-                "step": "Validating input",
-                "detail": "Checking draft length and selected model.",
-            },
-        )
-        if len(text.strip()) < 20:
-            yield json_line("error", {"detail": "Text too short for meaningful analysis."})
-            return
+    analysis: Dict[str, Any],
+    review_mode: str,
+    format_mode: str,
+) -> None:
+    if not session_id:
+        return
+    state = chat_sessions.setdefault(session_id, {"phase": "chat", "history": []})
+    issue_context = json.dumps(
+        {
+            "structure_or_writing_issues": analysis.get("structure_format_issues", [])[:8],
+            "academic_quality_issues": analysis.get("academic_quality_issues", [])[:8],
+            "citation_issues": analysis.get("citation_consistency_issues", [])[:8],
+            "priority_fixes": analysis.get("prioritized_suggestions", [])[:8],
+        },
+        ensure_ascii=True,
+    )
+    state["paper_context"] = (
+        f"Review mode: {review_mode}. Format style: {format_mode}.\n"
+        f"Review summary: {analysis.get('summary', '')}\n"
+        f"Review findings: {issue_context}\n"
+        f"Paper text:\n{text[:12000]}"
+    )
 
-        yield json_line(
-            "status",
-            {
-                "step": "Preparing prompt",
-                "detail": f"Building the {format_mode.upper()} review request for {model}.",
-            },
-        )
-        yield json_line(
-            "status",
-            {
-                "step": "Contacting Ollama",
-                "detail": f"Sending the draft to {model}.",
-            },
-        )
-        body = {
-            "model": model,
-            "prompt": build_analysis_prompt(text=text, metadata=metadata, format_mode=format_mode),
-            "stream": True,
-            "format": "json",
-            "options": {"temperature": 0.2},
-        }
-        raw_parts: List[str] = []
-        chunk_count = 0
-        with requests.post(f"{get_ollama_url()}/api/generate", json=body, timeout=90, stream=True) as resp:
-            if resp.status_code >= 400:
-                detail = resp.text.strip()
-                if resp.status_code == 404:
-                    raise RuntimeError(
-                        f"Ollama returned 404. The model '{model}' may not be installed, "
-                        f"or OLLAMA_URL may not point to Ollama. Response: {detail}"
-                    )
-                raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {detail}")
-
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                payload = json.loads(line)
-                piece = payload.get("response", "")
-                if piece:
-                    raw_parts.append(piece)
-                    chunk_count += 1
-                    if chunk_count == 1 or chunk_count % 12 == 0:
-                        yield json_line(
-                            "status",
-                            {
-                                "step": "Receiving model output",
-                                "detail": f"Ollama has streamed {chunk_count} response chunks.",
-                            },
-                        )
-                if payload.get("done"):
-                    break
-
-        yield json_line(
-            "status",
-            {
-                "step": "Parsing model output",
-                "detail": "Normalizing the structured feedback response.",
-            },
-        )
-        analysis = parse_ollama_analysis(raw="".join(raw_parts).strip(), text=text, format_mode=format_mode)
-        yield json_line("analysis", {"analysis": analysis})
-    except HTTPException as exc:
-        yield json_line("error", {"detail": exc.detail, "error_type": exc.__class__.__name__})
-    except Exception as exc:
-        logger.exception("Ollama streaming analysis failed")
-        yield json_line(
-            "status",
-            {
-                "step": "Using fallback",
-                "detail": "Ollama failed, so the backend is generating a safe fallback review.",
-            },
-        )
-        yield json_line(
-            "analysis",
-            {
-                "analysis": fallback_analysis(
-                    text=text,
-                    reason=f"{exc.__class__.__name__}: {exc}",
-                    format_mode=format_mode,
-                )
-            },
-        )
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    ollama_ok = True
-    ollama_error = None
+    ollama_reachable = True
     try:
-        resp = requests.get(f"{get_ollama_url()}/api/tags", timeout=5)
-        resp.raise_for_status()
-    except Exception as exc:
-        ollama_ok = False
-        ollama_error = str(exc)
+        requests.get(f"{get_ollama_url()}/api/tags", timeout=3).raise_for_status()
+    except Exception:
+        ollama_reachable = False
     return {
         "status": "ok",
         "service": "academic-review-mvp",
-        "ollama_model": get_ollama_model(),
-        "ollama_url": get_ollama_url(),
-        "ollama_reachable": ollama_ok,
-        "ollama_error": ollama_error,
+        "analysis_model": get_analysis_model(),
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "ollama_reachable": ollama_reachable,
     }
 
 
@@ -1483,68 +1525,27 @@ def health() -> Dict[str, Any]:
 def chat(req: ChatRequest) -> ChatResponse:
     state = chat_sessions.setdefault(
         req.session_id,
-        {"phase": "intake", "answers": {}, "question_index": 0, "history": []},
+        {"phase": "chat", "history": []},
     )
     message = req.message.strip()
-    state["history"].append({"role": "user", "message": message})
-
-    likely_draft = len(message.split()) >= 60 or len(message) >= 350
-    if likely_draft:
-        metadata = {
-            "source_type": "chat_message",
-            "intake_answers": state.get("answers", {}),
-            "instruction": "Analyze this academic draft directly.",
-            "format_mode": req.format_mode,
-        }
-        analysis = analyze_text_with_resilience(
-            text=message,
-            metadata=metadata,
+    state["history"].append({"role": "user", "content": message})
+    state["history"] = state["history"][-12:]
+    try:
+        reply = call_assistant_chat(
+            state["history"],
             model_override=req.model,
-            format_mode=req.format_mode or "general",
+            paper_context=state.get("paper_context"),
         )
-        state["phase"] = "analyzed"
-        return ChatResponse(
-            session_id=req.session_id,
-            phase="analyzed",
-            questions=[],
-            next_prompt="I analyzed the draft and organized the feedback into the review panel.",
-            context={"intake_answers": state.get("answers", {})},
-            analysis=analysis,
-        )
-
-    direct_review_phrases = [
-        "analyze",
-        "review",
-        "feedback",
-        "thoughts",
-        "check this",
-        "critique",
-    ]
-    if any(phrase in message.lower() for phrase in direct_review_phrases):
-        return ChatResponse(
-            session_id=req.session_id,
-            phase="ready_for_text",
-            questions=[],
-            next_prompt="Paste the academic text you want reviewed, and I will analyze it directly.",
-            context={"intake_answers": state.get("answers", {})},
-        )
-
-    if state["phase"] == "intake":
-        state["phase"] = "ready_for_text"
-        return ChatResponse(
-            session_id=req.session_id,
-            phase="ready_for_text",
-            questions=[],
-            next_prompt="Paste your academic text here and I will return structured feedback. You can also use the DOCX upload panel.",
-            context={"intake_answers": state["answers"]},
-        )
-
+    except Exception:
+        state["history"].pop()
+        raise
+    state["history"].append({"role": "assistant", "content": reply})
     return ChatResponse(
         session_id=req.session_id,
-        phase=state["phase"],
+        phase="chat",
         questions=[],
-        next_prompt="Session active. Submit text to /analyze_text or .docx to /analyze_docx.",
-        context={"intake_answers": state["answers"]},
+        next_prompt=reply,
+        context={"paper_context_available": bool(state.get("paper_context"))},
     )
 
 
@@ -1557,8 +1558,10 @@ def analyze_text(req: AnalyzeTextRequest) -> AnalysisResponse:
         text=text,
         metadata=req.metadata,
         model_override=req.model,
-        format_mode=req.format_mode or "general",
+        review_mode=req.review_mode or "format",
+        format_mode=req.format_mode or "apa7",
     )
+    remember_paper_context(req.session_id, text, data, req.review_mode or "format", req.format_mode or "apa7")
     return AnalysisResponse(**data)
 
 
@@ -1569,7 +1572,9 @@ def analyze_text_stream(req: AnalyzeTextStreamRequest) -> StreamingResponse:
             text=req.text.strip(),
             metadata=req.metadata,
             model_override=req.model,
-            format_mode=req.format_mode or "general",
+            session_id=req.session_id,
+            review_mode=req.review_mode or "format",
+            format_mode=req.format_mode or "apa7",
         ),
         media_type="application/x-ndjson",
     )
@@ -1578,8 +1583,10 @@ def analyze_text_stream(req: AnalyzeTextStreamRequest) -> StreamingResponse:
 @app.post("/analyze_docx", response_model=AnalysisResponse)
 async def analyze_docx(
     file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    format_mode: str = Form("general"),
+    review_mode: str = Form("format"),
+    format_mode: str = Form("apa7"),
 ) -> AnalysisResponse:
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported.")
@@ -1592,16 +1599,20 @@ async def analyze_docx(
         text=text,
         metadata=metadata,
         model_override=model,
+        review_mode=review_mode,
         format_mode=format_mode,
     )
+    remember_paper_context(session_id, text, data, review_mode, format_mode)
     return AnalysisResponse(**data)
 
 
 @app.post("/analyze_docx_stream")
 async def analyze_docx_stream(
     file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    format_mode: str = Form("general"),
+    review_mode: str = Form("format"),
+    format_mode: str = Form("apa7"),
 ) -> StreamingResponse:
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported.")
@@ -1627,6 +1638,8 @@ async def analyze_docx_stream(
             text=text,
             metadata=metadata,
             model_override=model,
+            session_id=session_id,
+            review_mode=review_mode,
             format_mode=format_mode,
         )
 
@@ -1682,100 +1695,111 @@ async def format_ieee_docx_export(file: UploadFile = File(...)) -> StreamingResp
 
 # Provider-aware overrides. These are intentionally defined after the routes because
 # route handlers resolve these globals at request time.
-def call_ollama_for_analysis(
+def call_model_for_analysis(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
-    format_mode: str = "general",
+    review_mode: str = "format",
+    format_mode: str = "apa7",
 ) -> Dict[str, Any]:
-    model = get_ollama_model(model_override)
+    model = get_analysis_model(model_override)
+    review_mode = normalize_review_mode(review_mode)
     format_mode = normalize_format_mode(format_mode)
-    prompt = build_analysis_prompt(text=text, metadata=metadata, format_mode=format_mode)
+    prompt = build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)
 
-    if is_groq_model(model):
-        body = {
-            "model": groq_model_id(model),
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-            "max_tokens": 2500,
-        }
+    if not is_openai_model(model):
         resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {get_groq_api_key()}",
-                "Content-Type": "application/json",
+            f"{get_ollama_url()}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.2},
             },
-            json=body,
             timeout=90,
         )
         if resp.status_code >= 400:
-            raise RuntimeError(f"Groq request failed with HTTP {resp.status_code}: {resp.text.strip()}")
-        payload = resp.json()
-        raw = payload["choices"][0]["message"]["content"].strip()
-        return parse_ollama_analysis(raw=raw, text=text, format_mode=format_mode)
+            raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {resp.text.strip()}")
+        raw = resp.json().get("response", "").strip()
+        analysis = parse_analysis_with_local_repair(
+            raw=raw,
+            text=text,
+            model=model,
+            review_mode=review_mode,
+            format_mode=format_mode,
+        )
+        analysis["source"] = "ollama"
+        return analysis
 
     body = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.2},
+        "model": openai_model_id(model),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 2500,
     }
-    resp = requests.post(f"{get_ollama_url()}/api/generate", json=body, timeout=90)
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {get_openai_api_key()}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=90,
+    )
     if resp.status_code >= 400:
-        detail = resp.text.strip()
-        if resp.status_code == 404:
-            raise RuntimeError(
-                f"Ollama returned 404. The model '{model}' may not be installed, "
-                f"or OLLAMA_URL may not point to Ollama. Response: {detail}"
-            )
-        raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {detail}")
+        raise RuntimeError(f"OpenAI request failed with HTTP {resp.status_code}: {resp.text.strip()}")
     payload = resp.json()
-    raw = payload.get("response", "").strip()
-    return parse_ollama_analysis(raw=raw, text=text, format_mode=format_mode)
+    raw = payload["choices"][0]["message"]["content"].strip()
+    return parse_model_analysis(raw=raw, text=text, review_mode=review_mode, format_mode=format_mode)
 
 
 def analyze_text_with_resilience(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
-    format_mode: str = "general",
+    review_mode: str = "format",
+    format_mode: str = "apa7",
 ) -> Dict[str, Any]:
     try:
-        return call_ollama_for_analysis(
+        return call_model_for_analysis(
             text=text,
             metadata=metadata,
             model_override=model_override,
+            review_mode=review_mode,
             format_mode=format_mode,
         )
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Hosted/local model analysis failed")
-        return fallback_analysis(text=text, reason=str(exc), format_mode=format_mode)
+        return fallback_analysis(text=text, reason=str(exc), review_mode=review_mode, format_mode=format_mode)
 
 
 def analysis_event_stream(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
-    format_mode: str = "general",
+    session_id: Optional[str] = None,
+    review_mode: str = "format",
+    format_mode: str = "apa7",
 ) -> Generator[str, None, None]:
     try:
-        model = get_ollama_model(model_override)
+        model = get_analysis_model(model_override)
+        review_mode = normalize_review_mode(review_mode)
         format_mode = normalize_format_mode(format_mode)
         yield json_line("status", {"step": "Validating input", "detail": "Checking draft length and selected model."})
         if len(text.strip()) < 20:
             yield json_line("error", {"detail": "Text too short for meaningful analysis."})
             return
 
-        provider = "Groq" if is_groq_model(model) else "Ollama"
+        provider = "OpenAI" if is_openai_model(model) else "Ollama"
         yield json_line(
             "status",
             {
                 "step": "Preparing prompt",
-                "detail": f"Building the {format_mode.upper()} review request for {provider}.",
+                "detail": f"Building the {review_mode} review request for {provider}.",
             },
         )
         yield json_line("status", {"step": f"Contacting {provider}", "detail": f"Sending the draft to {model}."})
@@ -1783,85 +1807,95 @@ def analysis_event_stream(
         raw_parts: List[str] = []
         chunk_count = 0
 
-        if is_groq_model(model):
+        if is_openai_model(model):
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {get_openai_api_key()}",
+                "Content-Type": "application/json",
+            }
             body = {
-                "model": groq_model_id(model),
-                "messages": [{"role": "user", "content": build_analysis_prompt(text=text, metadata=metadata, format_mode=format_mode)}],
+                "model": openai_model_id(model),
+                "messages": [{"role": "user", "content": build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)}],
                 "temperature": 0.2,
                 "response_format": {"type": "json_object"},
                 "max_tokens": 2500,
                 "stream": True,
             }
-            with requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {get_groq_api_key()}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=90,
-                stream=True,
-            ) as resp:
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"Groq request failed with HTTP {resp.status_code}: {resp.text.strip()}")
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data: "):
+        else:
+            url = f"{get_ollama_url()}/api/generate"
+            headers = {}
+            body = {
+                "model": model,
+                "prompt": build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode),
+                "stream": True,
+                "format": "json",
+                "options": {"temperature": 0.2},
+            }
+        with requests.post(url, headers=headers, json=body, timeout=90, stream=True) as resp:
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{provider} request failed with HTTP {resp.status_code}: {resp.text.strip()}")
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if is_openai_model(model):
+                    if not line.startswith("data: "):
                         continue
                     data = line.removeprefix("data: ").strip()
                     if data == "[DONE]":
                         break
                     payload = json.loads(data)
                     piece = payload.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                    if piece:
-                        raw_parts.append(piece)
-                        chunk_count += 1
-                        if chunk_count == 1 or chunk_count % 12 == 0:
-                            yield json_line(
-                                "status",
-                                {
-                                    "step": "Receiving hosted model output",
-                                    "detail": f"Groq has streamed {chunk_count} response chunks.",
-                                },
-                            )
-        else:
-            body = {
-                "model": model,
-                "prompt": build_analysis_prompt(text=text, metadata=metadata, format_mode=format_mode),
-                "stream": True,
-                "format": "json",
-                "options": {"temperature": 0.2},
-            }
-            with requests.post(f"{get_ollama_url()}/api/generate", json=body, timeout=90, stream=True) as resp:
-                if resp.status_code >= 400:
-                    detail = resp.text.strip()
-                    if resp.status_code == 404:
-                        raise RuntimeError(
-                            f"Ollama returned 404. The model '{model}' may not be installed, "
-                            f"or OLLAMA_URL may not point to Ollama. Response: {detail}"
-                        )
-                    raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {detail}")
-
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
+                else:
                     payload = json.loads(line)
                     piece = payload.get("response", "")
-                    if piece:
-                        raw_parts.append(piece)
-                        chunk_count += 1
-                        if chunk_count == 1 or chunk_count % 12 == 0:
-                            yield json_line(
-                                "status",
-                                {
-                                    "step": "Receiving local model output",
-                                    "detail": f"Ollama has streamed {chunk_count} response chunks.",
-                                },
-                            )
-                    if payload.get("done"):
-                        break
+                if piece:
+                    raw_parts.append(piece)
+                    chunk_count += 1
+                    if chunk_count == 1 or chunk_count % 12 == 0:
+                        yield json_line(
+                            "status",
+                            {
+                                "step": f"Receiving {provider} output",
+                                "detail": f"{provider} has streamed {chunk_count} response chunks.",
+                            },
+                        )
+                if not is_openai_model(model) and payload.get("done"):
+                    break
 
         yield json_line("status", {"step": "Parsing model output", "detail": "Normalizing the structured feedback response."})
-        analysis = parse_ollama_analysis(raw="".join(raw_parts).strip(), text=text, format_mode=format_mode)
+        raw = "".join(raw_parts).strip()
+        if is_openai_model(model):
+            analysis = parse_model_analysis(
+                raw=raw,
+                text=text,
+                review_mode=review_mode,
+                format_mode=format_mode,
+            )
+        else:
+            try:
+                analysis = parse_model_analysis(
+                    raw=raw,
+                    text=text,
+                    review_mode=review_mode,
+                    format_mode=format_mode,
+                )
+            except json.JSONDecodeError:
+                yield json_line(
+                    "status",
+                    {
+                        "step": "Repairing local model output",
+                        "detail": "Gemma returned malformed JSON. Asking the local model to repair the structured response.",
+                    },
+                )
+                analysis = parse_analysis_with_local_repair(
+                    raw=raw,
+                    text=text,
+                    model=model,
+                    review_mode=review_mode,
+                    format_mode=format_mode,
+                )
+        analysis["source"] = "openai" if is_openai_model(model) else "ollama"
+        remember_paper_context(session_id, text, analysis, review_mode, format_mode)
         yield json_line("analysis", {"analysis": analysis})
     except HTTPException as exc:
         yield json_line("error", {"detail": exc.detail, "error_type": exc.__class__.__name__})
@@ -1874,13 +1908,11 @@ def analysis_event_stream(
                 "detail": "The selected model failed, so the backend is generating a safe fallback review.",
             },
         )
-        yield json_line(
-            "analysis",
-            {
-                "analysis": fallback_analysis(
-                    text=text,
-                    reason=f"{exc.__class__.__name__}: {exc}",
-                    format_mode=format_mode,
-                )
-            },
+        analysis = fallback_analysis(
+            text=text,
+            reason=f"{exc.__class__.__name__}: {exc}",
+            review_mode=review_mode,
+            format_mode=format_mode,
         )
+        remember_paper_context(session_id, text, analysis, review_mode, format_mode)
+        yield json_line("analysis", {"analysis": analysis})

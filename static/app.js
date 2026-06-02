@@ -1,4 +1,4 @@
-const sessionId = `session-${Date.now()}`;
+let sessionId = `session-${Date.now()}`;
 
 const messages = document.querySelector("#messages");
 const chatForm = document.querySelector("#chatForm");
@@ -6,13 +6,13 @@ const chatInput = document.querySelector("#chatInput");
 const resetBtn = document.querySelector("#resetBtn");
 const healthStatus = document.querySelector("#healthStatus");
 const modelSelect = document.querySelector("#modelSelect");
+const reviewModeSelect = document.querySelector("#reviewModeSelect");
+const formatControl = document.querySelector("#formatControl");
 const formatSelect = document.querySelector("#formatSelect");
 const textTab = document.querySelector("#textTab");
 const docxTab = document.querySelector("#docxTab");
 const textForm = document.querySelector("#textForm");
 const docxForm = document.querySelector("#docxForm");
-const fixIeeeTextBtn = document.querySelector("#fixIeeeTextBtn");
-const fixIeeeDocxBtn = document.querySelector("#fixIeeeDocxBtn");
 const draftText = document.querySelector("#draftText");
 const docxFile = document.querySelector("#docxFile");
 const fileLabel = document.querySelector("#fileLabel");
@@ -30,10 +30,62 @@ function selectedFormat() {
   return formatSelect.value;
 }
 
+function selectedReviewMode() {
+  return reviewModeSelect.value;
+}
+
+function renderInlineMarkdown(value) {
+  return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+}
+
+function renderAssistantMarkdown(value) {
+  const normalized = String(value ?? "").replace(/\s+(?=\d+\.\s+\*\*)/g, "\n");
+  const lines = normalized.split(/\r?\n/);
+  const html = [];
+  const lists = [];
+
+  function closeLists(targetIndent = -1) {
+    while (lists.length && lists[lists.length - 1].indent >= targetIndent) {
+      html.push(`</${lists.pop().tag}>`);
+    }
+  }
+
+  lines.forEach((line) => {
+    const match = line.match(/^(\s*)(?:(\d+)\.|[-*])\s+(.+)$/);
+    if (match) {
+      const indent = match[1].replace(/\t/g, "  ").length;
+      const tag = match[2] ? "ol" : "ul";
+      while (lists.length && indent < lists[lists.length - 1].indent) {
+        html.push(`</${lists.pop().tag}>`);
+      }
+      if (!lists.length || indent > lists[lists.length - 1].indent || lists[lists.length - 1].tag !== tag) {
+        if (lists.length && indent === lists[lists.length - 1].indent) {
+          html.push(`</${lists.pop().tag}>`);
+        }
+        html.push(`<${tag} class="chat-list chat-list-depth-${lists.length}">`);
+        lists.push({ indent, tag });
+      }
+      html.push(`<li>${renderInlineMarkdown(match[3])}</li>`);
+      return;
+    }
+
+    closeLists();
+    if (line.trim()) {
+      html.push(`<p>${renderInlineMarkdown(line.trim())}</p>`);
+    }
+  });
+  closeLists();
+  return html.join("");
+}
+
 function addMessage(role, text, isError = false) {
   const node = document.createElement("div");
   node.className = `message ${role}${isError ? " error" : ""}`;
-  node.textContent = text;
+  if (role === "agent" && !isError) {
+    node.innerHTML = renderAssistantMarkdown(text);
+  } else {
+    node.textContent = text;
+  }
   messages.appendChild(node);
   messages.scrollTop = messages.scrollHeight;
 }
@@ -152,15 +204,12 @@ async function apiStream(path, options = {}, handlers = {}) {
 async function checkHealth() {
   try {
     const health = await apiJson("/health");
-    if (selectedModel().startsWith("groq:")) {
-      healthStatus.className = "status-pill ok";
-      healthStatus.textContent = "Groq hosted model selected";
-      return;
-    }
-    healthStatus.className = `status-pill ${health.ollama_reachable ? "ok" : "bad"}`;
-    healthStatus.textContent = health.ollama_reachable
-      ? `Ollama ready: ${selectedModel()}`
-      : "API ready, Ollama fallback active";
+    const localGemma = selectedModel() === "gemma3:1b";
+    const ready = localGemma ? health.ollama_reachable : health.openai_configured;
+    healthStatus.className = `status-pill ${ready ? "ok" : "bad"}`;
+    healthStatus.textContent = localGemma
+      ? ready ? "Local Gemma ready" : "Start Ollama for Gemma"
+      : ready ? "OpenAI ready" : "Add OPENAI_API_KEY";
   } catch (error) {
     healthStatus.className = "status-pill bad";
     healthStatus.textContent = "API unavailable";
@@ -169,31 +218,6 @@ async function checkHealth() {
 
 async function sendChat(message) {
   addMessage("user", message);
-  const likelyDraft = message.trim().split(/\s+/).length >= 60 || message.length >= 350;
-  if (likelyDraft) {
-    startThinking("Sending draft", "The backend is receiving the chat text.");
-    await apiStream(
-      "/analyze_text_stream",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: message,
-          model: selectedModel(),
-          format_mode: selectedFormat(),
-          metadata: { source_type: "chat_message", format_mode: selectedFormat() },
-        }),
-      },
-      {
-        status: (event) => updateThinking(event.step, event.detail),
-        analysis: (analysis) => {
-          addMessage("agent", "I analyzed the draft and organized the feedback into the review panel.");
-          renderResults(analysis);
-        },
-      },
-    );
-    return;
-  }
   const data = await apiJson("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -208,8 +232,6 @@ async function sendChat(message) {
   if (data.analysis) {
     stopThinking();
     renderResults(data.analysis);
-  } else if (likelyDraft) {
-    stopThinking();
   }
 }
 
@@ -288,17 +310,23 @@ function renderHighlightedText(text, highlights = []) {
 }
 
 function renderSection(title, items, emptyText, mode = "issue") {
-  const body = items?.length
-    ? `<div class="issue-list">${items.map((item) => issueHtml(item, mode)).join("")}</div>`
+  const meaningfulItems = (items || []).filter((item) => {
+    const title = String(item?.issue || item?.suggestion || "").trim();
+    const detail = String(item?.evidence || item?.rationale || item?.recommendation || item?.expected_impact || "").trim();
+    return title && detail;
+  });
+  const body = meaningfulItems.length
+    ? `<div class="issue-list">${meaningfulItems.map((item) => issueHtml(item, mode)).join("")}</div>`
     : `<p>${emptyText}</p>`;
   return `<article class="result-card"><h3>${escapeHtml(title)}</h3>${body}</article>`;
 }
 
 function renderRewrites(items) {
-  if (!items?.length) {
-    return `<article class="result-card"><h3>Optional Rewrite Suggestions</h3><p>No rewrite suggestions returned.</p></article>`;
-  }
-  const body = items
+  const meaningfulItems = (items || []).filter(
+    (item) => String(item?.original_excerpt || "").trim() && String(item?.rewritten_excerpt || "").trim(),
+  );
+  if (!meaningfulItems.length) return "";
+  const body = meaningfulItems
     .map(
       (item) => `
         <div class="issue">
@@ -309,7 +337,7 @@ function renderRewrites(items) {
       `,
     )
     .join("");
-  return `<article class="result-card"><h3>Optional Rewrite Suggestions</h3><div class="issue-list">${body}</div></article>`;
+  return `<article class="result-card"><h3>Rewrite Examples</h3><div class="issue-list">${body}</div></article>`;
 }
 
 function renderFormatResults(data) {
@@ -402,7 +430,7 @@ function renderResults(data) {
   resultState.classList.add("hidden");
   results.classList.remove("hidden");
   const fallbackNote = data.fallback_used
-    ? `<p><strong>Fallback used:</strong> Ollama was unavailable or returned invalid output.</p>`
+    ? `<p><strong>Fallback used:</strong> The selected model was unavailable or returned invalid output.</p>`
     : "";
   results.innerHTML = `
     <article class="result-card">
@@ -411,11 +439,11 @@ function renderResults(data) {
       ${fallbackNote}
     </article>
     ${renderHighlightedText(data.reviewed_text, data.highlights)}
-    ${renderSection("Structure / Format Issues", data.structure_format_issues, "No structure issues returned.")}
-    ${renderSection("Academic Quality Issues", data.academic_quality_issues, "No academic quality issues returned.")}
-    ${renderSection("Citation / Consistency Issues", data.citation_consistency_issues, "No citation issues returned.")}
-    ${renderSection("Prioritized Suggestions", data.prioritized_suggestions, "No prioritized suggestions returned.", "suggestion")}
-    ${renderRewrites(data.optional_rewrite_suggestions)}
+    ${renderSection(selectedReviewMode() === "format" ? "Formatting Violations" : "Structure / Writing Issues", data.structure_format_issues, "No issues detected.")}
+    ${renderSection("Academic Quality Issues", data.academic_quality_issues, "No academic quality issues detected.")}
+    ${renderSection(selectedReviewMode() === "format" ? "Citation / Reference Violations" : "Citation Needs", data.citation_consistency_issues, "No citation issues detected.")}
+    ${renderSection("Priority Fixes", data.prioritized_suggestions, "No priority fixes required.", "suggestion")}
+    ${selectedReviewMode() === "academic" ? renderRewrites(data.optional_rewrite_suggestions) : ""}
   `;
 }
 
@@ -441,8 +469,9 @@ chatForm.addEventListener("submit", async (event) => {
 });
 
 resetBtn.addEventListener("click", () => {
+  sessionId = `session-${Date.now()}`;
   messages.innerHTML = "";
-  addMessage("agent", "Paste your academic text here, or ask me to review a draft.");
+  addMessage("agent", "Ask me about your academic paper. I can help with planning, structure, citations, revisions, APA 7, and IEEE.");
   setReady("Ready", "Paste text into chat or use the review panel.");
 });
 
@@ -453,10 +482,18 @@ docxFile.addEventListener("change", () => {
   fileLabel.textContent = docxFile.files[0]?.name || "Choose a .docx file";
 });
 
-modelSelect.addEventListener("change", checkHealth);
 formatSelect.addEventListener("change", () => {
-  setReady("Format Mode Updated", `Reviews will now check against ${formatSelect.options[formatSelect.selectedIndex].text}.`);
+  setReady("Format Style Updated", `Format checks will now use ${formatSelect.options[formatSelect.selectedIndex].text} rules.`);
 });
+reviewModeSelect.addEventListener("change", () => {
+  const formatMode = selectedReviewMode() === "format";
+  formatControl.classList.toggle("hidden", !formatMode);
+  setReady(
+    "Review Mode Updated",
+    formatMode ? "The analyzer will check formatting and reference-style violations." : "The analyzer will review writing quality, grammar, clarity, and citation needs.",
+  );
+});
+modelSelect.addEventListener("change", checkHealth);
 
 textForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -472,7 +509,13 @@ textForm.addEventListener("submit", async (event) => {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model: selectedModel(), format_mode: selectedFormat() }),
+        body: JSON.stringify({
+          text,
+          session_id: sessionId,
+          model: selectedModel(),
+          review_mode: selectedReviewMode(),
+          format_mode: selectedFormat(),
+        }),
       },
       {
         status: (event) => updateThinking(event.step, event.detail),
@@ -493,7 +536,9 @@ docxForm.addEventListener("submit", async (event) => {
   }
   const formData = new FormData();
   formData.append("file", file);
+  formData.append("session_id", sessionId);
   formData.append("model", selectedModel());
+  formData.append("review_mode", selectedReviewMode());
   formData.append("format_mode", selectedFormat());
   setBusy("Analyzing DOCX");
   try {
@@ -513,44 +558,5 @@ docxForm.addEventListener("submit", async (event) => {
   }
 });
 
-fixIeeeTextBtn.addEventListener("click", async () => {
-  const text = draftText.value.trim();
-  if (text.length < 20) {
-    setReady("Need More Text", "Paste at least 20 characters before formatting.");
-    return;
-  }
-  startThinking("Fixing IEEE format", "Running deterministic citation and reference formatting checks.");
-  try {
-    const data = await apiJson("/format_ieee_text", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    renderFormatResults(data);
-  } catch (error) {
-    setReady("IEEE Format Failed", error.message);
-  }
-});
-
-fixIeeeDocxBtn.addEventListener("click", async () => {
-  const file = docxFile.files[0];
-  if (!file) {
-    setReady("Missing File", "Choose a .docx file first.");
-    return;
-  }
-  const formData = new FormData();
-  formData.append("file", file);
-  startThinking("Fixing IEEE format", "Extracting DOCX text and running deterministic IEEE checks.");
-  try {
-    const data = await apiJson("/format_ieee_docx", {
-      method: "POST",
-      body: formData,
-    });
-    renderFormatResults(data);
-  } catch (error) {
-    setReady("IEEE Format Failed", error.message);
-  }
-});
-
-addMessage("agent", "Paste your academic text here, or ask me to review a draft.");
+addMessage("agent", "Ask me about your academic paper. I can help with planning, structure, citations, revisions, APA 7, and IEEE.");
 checkHealth();

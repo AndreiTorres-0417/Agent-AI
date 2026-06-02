@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@500;650&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260602-1" />
   </head>
   <body>
     <main class="shell">
@@ -21,17 +21,22 @@
         </div>
         <div class="top-controls">
           <label class="model-switch" for="modelSelect">
-            <span>Model</span>
+            <span>AI Model</span>
             <select id="modelSelect">
-              <option value="deepseek-r1:8b">DeepSeek R1 8B</option>
-              <option value="gemma3:1b">Gemma 3 1B</option>
-              <option value="groq:llama-3.1-8b-instant">Groq Llama 3.1 8B Instant</option>
+              <option value="openai:gpt-4.1-mini">OpenAI GPT-4.1 mini</option>
+              <option value="gemma3:1b">Local Gemma 3 1B</option>
             </select>
           </label>
-          <label class="model-switch" for="formatSelect">
-            <span>Format Mode</span>
+          <label class="model-switch" for="reviewModeSelect">
+            <span>Review Mode</span>
+            <select id="reviewModeSelect">
+              <option value="format">Format Checker</option>
+              <option value="academic">General Academic Review</option>
+            </select>
+          </label>
+          <label class="model-switch" id="formatControl" for="formatSelect">
+            <span>Format Style</span>
             <select id="formatSelect">
-              <option value="general">General Review</option>
               <option value="apa7">APA 7</option>
               <option value="ieee">IEEE</option>
             </select>
@@ -41,11 +46,11 @@
       </section>
 
       <section class="workspace">
-        <aside class="chat-panel" aria-label="Intake chat">
+        <aside class="chat-panel" aria-label="Academic paper assistant chat">
           <div class="panel-header">
             <div>
               <p class="eyebrow">Step 1</p>
-              <h2>Intake Chat</h2>
+              <h2>Academic Paper Assistant</h2>
             </div>
             <button class="ghost-button" id="resetBtn" type="button">Reset</button>
           </div>
@@ -57,7 +62,7 @@
               id="chatInput"
               type="text"
               autocomplete="off"
-              placeholder="Paste text or ask for review..."
+              placeholder="Ask about your academic paper..."
               required
             />
             <button type="submit">Send</button>
@@ -82,10 +87,7 @@
               placeholder="Paste your academic draft here..."
               minlength="20"
             ></textarea>
-            <div class="action-row">
-              <button class="primary-action" type="submit">Analyze Text</button>
-              <button class="secondary-action" id="fixIeeeTextBtn" type="button">Fix IEEE Format</button>
-            </div>
+            <button class="primary-action" type="submit">Analyze Draft</button>
           </form>
 
           <form class="analysis-form hidden" id="docxForm">
@@ -93,10 +95,7 @@
               <span id="fileLabel">Choose a .docx file</span>
               <input id="docxFile" type="file" accept=".docx" required />
             </label>
-            <div class="action-row">
-              <button class="primary-action" type="submit">Analyze DOCX</button>
-              <button class="secondary-action" id="fixIeeeDocxBtn" type="button">Fix IEEE Format</button>
-            </div>
+            <button class="primary-action" type="submit">Analyze Draft</button>
           </form>
 
           <div class="result-state" id="resultState">
