@@ -60,8 +60,8 @@ class AnalyzeTextRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Chat session that should receive the paper context")
     metadata: Optional[Dict[str, Any]] = None
     model: Optional[str] = Field(None, description="Document analysis model: OpenAI or local Gemma")
-    review_mode: Optional[str] = Field("format", description="Review mode: format or academic")
-    format_mode: Optional[str] = Field("apa7", description="Compliance style: apa7 or ieee")
+    review_mode: Optional[str] = Field("academic", description="Review mode: academic")
+    format_mode: Optional[str] = Field("ieee", description="Compliance style: ieee")
 
 
 class AnalyzeTextStreamRequest(AnalyzeTextRequest):
@@ -148,6 +148,7 @@ def index() -> FileResponse:
 ALLOWED_MODELS = {"openai:gpt-4.1-mini", "gemma3:1b"}
 ALLOWED_REVIEW_MODES = {"format", "academic"}
 ALLOWED_FORMAT_MODES = {"apa7", "ieee"}
+REFERENCE_HEADING_RE = re.compile(r"^\s*#{0,6}\s*references\s*$", re.IGNORECASE)
 
 
 def get_analysis_model(model_override: Optional[str] = None) -> str:
@@ -162,6 +163,24 @@ def get_analysis_model(model_override: Optional[str] = None) -> str:
 
 def get_ollama_url() -> str:
     return os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+
+
+def get_ollama_timeout() -> int:
+    try:
+        return int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
+    except ValueError:
+        return 600
+
+
+def ollama_options(kind: str = "analysis") -> Dict[str, Any]:
+    num_predict_by_kind = {
+        "chat": 300,
+        "analysis": 2200,
+    }
+    return {
+        "temperature": 0.2 if kind != "chat" else 0.3,
+        "num_predict": num_predict_by_kind.get(kind, 2200),
+    }
 
 
 def is_openai_model(model: str) -> bool:
@@ -194,10 +213,96 @@ user's specific request cannot be answered without clarification. Do not use emo
 """.strip()
 
 
+SECTION_ALIASES = {
+    "abstract": ["abstract"],
+    "introduction": ["introduction", "intro"],
+    "literature review": ["literature review", "related work", "background"],
+    "methodology": ["methodology", "methods", "method", "materials and methods"],
+    "results": ["results", "findings"],
+    "discussion": ["discussion"],
+    "conclusion": ["conclusion", "conclusions"],
+    "references": ["references", "reference list", "bibliography", "works cited"],
+}
+
+
+def normalize_section_title(title: str) -> str:
+    cleaned = re.sub(r"^\s*#{1,6}\s*", "", title).strip()
+    cleaned = re.sub(r"^(?:[IVXLC]+|\d+)\.\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+", " ", cleaned).lower()
+
+
+def looks_like_section_heading(line: str) -> Optional[str]:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    markdown_heading = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
+    if markdown_heading:
+        return markdown_heading.group(1).strip()
+    numbered_heading = re.match(r"^(?:[IVXLC]+|\d+)\.\s+(.+?)\s*$", stripped, flags=re.IGNORECASE)
+    if numbered_heading:
+        return numbered_heading.group(1).strip()
+    normalized = normalize_section_title(stripped)
+    known_names = {alias for aliases in SECTION_ALIASES.values() for alias in aliases}
+    if normalized in known_names:
+        return stripped
+    return None
+
+
+def extract_paper_sections(text: str) -> List[Dict[str, str]]:
+    lines = text.splitlines()
+    headings: List[Dict[str, Any]] = []
+    for idx, line in enumerate(lines):
+        title = looks_like_section_heading(line)
+        if title:
+            headings.append({"line": idx, "title": title, "heading": line.strip()})
+    sections: List[Dict[str, str]] = []
+    for pos, heading in enumerate(headings):
+        start = int(heading["line"]) + 1
+        end = int(headings[pos + 1]["line"]) if pos + 1 < len(headings) else len(lines)
+        content = "\n".join(lines[start:end]).strip()
+        if content:
+            sections.append(
+                {
+                    "title": str(heading["title"]),
+                    "normalized_title": normalize_section_title(str(heading["title"])),
+                    "heading": str(heading["heading"]),
+                    "content": content,
+                }
+            )
+    return sections
+
+
+def requested_section_key(message: str) -> Optional[str]:
+    lowered = message.lower()
+    for key, aliases in SECTION_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", lowered):
+                return key
+    return None
+
+
+def find_requested_section(message: str, sections: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    key = requested_section_key(message)
+    if not key:
+        return None
+    aliases = SECTION_ALIASES[key]
+    for section in sections:
+        title = section["normalized_title"]
+        if title == key or title in aliases or any(alias in title for alias in aliases):
+            return section
+    return {
+        "title": key.title(),
+        "normalized_title": key,
+        "heading": key.title(),
+        "content": "",
+    }
+
+
 def call_assistant_chat(
     messages: List[Dict[str, str]],
     model_override: Optional[str] = None,
     paper_context: Optional[str] = None,
+    focused_section: Optional[Dict[str, str]] = None,
 ) -> str:
     model = model_override or os.getenv("OPENAI_CHAT_MODEL", "openai:gpt-4.1-mini")
     if model not in ALLOWED_MODELS:
@@ -211,6 +316,19 @@ def call_assistant_chat(
             "\n\nThe user has analyzed a paper in Step 2. Use the following paper context when answering "
             "follow-up questions. Do not claim details beyond this context:\n" + paper_context
         )
+    if focused_section:
+        if focused_section.get("content"):
+            system_prompt += (
+                "\n\nThe latest user question appears to ask about this specific paper section. "
+                "Analyze this section directly and do not guess about section content outside this excerpt unless needed for brief context.\n"
+                f"Requested section: {focused_section.get('title', '')}\n"
+                f"Section text:\n{focused_section.get('content', '')[:5000]}"
+            )
+        else:
+            system_prompt += (
+                "\n\nThe latest user question appears to ask about a section, but that section was not found in the analyzed paper. "
+                f"Requested section: {focused_section.get('title', '')}. Say that the section was not found and ask the user to paste it."
+            )
     chat_messages = [{"role": "system", "content": system_prompt}, *messages]
     if not is_openai_model(model):
         resp = requests.post(
@@ -219,9 +337,9 @@ def call_assistant_chat(
                 "model": model,
                 "messages": chat_messages,
                 "stream": False,
-                "options": {"temperature": 0.3},
+                "options": ollama_options("chat"),
             },
-            timeout=90,
+            timeout=get_ollama_timeout(),
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {resp.text.strip()}")
@@ -247,7 +365,7 @@ def call_assistant_chat(
 
 
 def normalize_format_mode(format_mode: Optional[str] = None) -> str:
-    mode = (format_mode or "apa7").lower()
+    mode = (format_mode or "ieee").lower()
     if mode not in ALLOWED_FORMAT_MODES:
         raise HTTPException(
             status_code=400,
@@ -257,7 +375,7 @@ def normalize_format_mode(format_mode: Optional[str] = None) -> str:
 
 
 def normalize_review_mode(review_mode: Optional[str] = None) -> str:
-    mode = (review_mode or "format").lower()
+    mode = (review_mode or "academic").lower()
     if mode not in ALLOWED_REVIEW_MODES:
         raise HTTPException(
             status_code=400,
@@ -984,14 +1102,14 @@ def extract_docx_text(file_bytes: bytes) -> str:
 def fallback_analysis(
     text: str,
     reason: str,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Dict[str, Any]:
     review_mode = normalize_review_mode(review_mode)
     format_mode = normalize_format_mode(format_mode)
     if review_mode == "academic":
-        return {
-            "summary": f"General academic review could not use the selected AI model ({reason}). Retry when the model is available.",
+        data = {
+            "summary": f"General academic review completed with deterministic checks because the selected AI model returned invalid output ({reason}).",
             "structure_format_issues": [],
             "academic_quality_issues": [],
             "citation_consistency_issues": [],
@@ -1002,6 +1120,7 @@ def fallback_analysis(
             "source": "fallback",
             "fallback_used": True,
         }
+        return merge_academic_safety_findings(data, text)
     data = {
         "summary": f"{format_mode.upper()} compliance review completed with deterministic checks because the model was unavailable ({reason}).",
         "structure_format_issues": [],
@@ -1017,7 +1136,7 @@ def fallback_analysis(
     return merge_deterministic_findings(data, text, format_mode=format_mode)
 
 
-def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, List[Dict[str, str]]]:
+def deterministic_findings(text: str, format_mode: str = "ieee") -> Dict[str, List[Dict[str, str]]]:
     format_mode = normalize_format_mode(format_mode)
     structure_issues: List[Dict[str, str]] = []
     citation_issues: List[Dict[str, str]] = []
@@ -1051,11 +1170,20 @@ def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, Li
             )
 
     lines = text.splitlines()
-    has_references_heading = bool(re.search(r"(?im)^\s*references\s*$", text))
+    has_references_heading = any(REFERENCE_HEADING_RE.match(line) for line in text.splitlines())
     wrong_reference_heading = re.search(r"(?im)^\s*(bibliography|works cited|reference list)\s*$", text)
     apa_citations = re.findall(r"\([A-Z][A-Za-z' -]+(?:\s+et al\.)?,\s*\d{4}[a-z]?\)", text)
     apa_citations.extend(re.findall(r"\b[A-Z][A-Za-z'-]+\s+\(\d{4}[a-z]?\)", text))
-    ieee_citations = re.findall(r"\[(\d+)\]", text)
+    body_lines_for_citations: List[str] = []
+    in_refs_for_citations = False
+    for line in lines:
+        if REFERENCE_HEADING_RE.match(line):
+            in_refs_for_citations = True
+            continue
+        if not in_refs_for_citations:
+            body_lines_for_citations.append(line)
+    body_text_for_citations = "\n".join(body_lines_for_citations)
+    ieee_citations = re.findall(r"\[(\d+)\]", body_text_for_citations)
     figure_lines = [line.strip() for line in lines if re.match(r"(?i)^\s*(fig(?:ure)?\.?)\s*\d+", line)]
     table_lines = [line.strip() for line in lines if re.match(r"(?i)^\s*table\s+[A-Z0-9IVX]+", line)]
 
@@ -1098,7 +1226,7 @@ def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, Li
         reference_lines: List[str] = []
         in_references = False
         for line in lines:
-            if re.match(r"(?i)^\s*references\s*$", line):
+            if REFERENCE_HEADING_RE.match(line):
                 in_references = True
                 continue
             if in_references and line.strip():
@@ -1201,7 +1329,7 @@ def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, Li
         in_references = False
         unnumbered_reference = ""
         for line in lines:
-            if re.match(r"(?i)^\s*references\s*$", line):
+            if REFERENCE_HEADING_RE.match(line):
                 in_references = True
                 continue
             if not in_references or not line.strip():
@@ -1228,6 +1356,21 @@ def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, Li
                 "Number references sequentially in order of first citation: [1], [2], [3], and so on.",
                 severity="high",
             )
+        body_citation_numbers = [int(value) for value in ieee_citations]
+        if body_citation_numbers:
+            first_seen: List[int] = []
+            for number in body_citation_numbers:
+                if number not in first_seen:
+                    first_seen.append(number)
+            expected = list(range(1, len(first_seen) + 1))
+            if first_seen != expected:
+                add_issue(
+                    citation_issues,
+                    "IEEE in-text citations are not numbered by first appearance",
+                    f"Detected first appearances as {first_seen}. Repeated citations are allowed, but new citation numbers should appear as {expected}.",
+                    "Use IEEE citation numbers in order of first appearance. Repeats like [1], [2], [1], [3] are valid; new out-of-order citations like [2], [1], [3] are not.",
+                    severity="high",
+                )
         missing_entries = sorted(set(int(value) for value in ieee_citations) - set(reference_numbers))
         if missing_entries and has_references_heading:
             add_issue(
@@ -1258,7 +1401,7 @@ def deterministic_findings(text: str, format_mode: str = "apa7") -> Dict[str, Li
     }
 
 
-def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: str = "apa7") -> Dict[str, Any]:
+def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: str = "ieee") -> Dict[str, Any]:
     findings = deterministic_findings(text, format_mode=format_mode)
     for field, items in findings.items():
         existing = data.get(field, [])
@@ -1278,11 +1421,252 @@ def merge_deterministic_findings(data: Dict[str, Any], text: str, format_mode: s
     return data
 
 
+def merge_academic_safety_findings(data: Dict[str, Any], text: str) -> Dict[str, Any]:
+    academic_issues = data.get("academic_quality_issues", [])
+    citation_issues = data.get("citation_consistency_issues", [])
+    suggestions = data.get("prioritized_suggestions", [])
+    highlights = data.get("highlights", [])
+    if not isinstance(academic_issues, list):
+        academic_issues = []
+    if not isinstance(citation_issues, list):
+        citation_issues = []
+    if not isinstance(suggestions, list):
+        suggestions = []
+    if not isinstance(highlights, list):
+        highlights = []
+
+    existing_titles = {
+        str(item.get("issue") or item.get("suggestion") or "").strip().lower()
+        for item in [*academic_issues, *citation_issues, *suggestions]
+        if isinstance(item, dict)
+    }
+
+    def add_academic_issue(issue: str, severity: str, evidence: str, recommendation: str, excerpt: str = "") -> None:
+        key = issue.lower()
+        if key in existing_titles:
+            return
+        academic_issues.append(
+            {
+                "issue": issue,
+                "severity": severity,
+                "evidence": evidence,
+                "recommendation": recommendation,
+            }
+        )
+        suggestions.append(
+            {
+                "priority": severity,
+                "suggestion": recommendation,
+                "rationale": evidence,
+                "expected_impact": "Improves the paper's academic focus, depth, or scholarly credibility.",
+            }
+        )
+        if excerpt:
+            highlights.append(
+                {
+                    "excerpt": excerpt,
+                    "message": f"{issue}: {recommendation}",
+                    "severity": severity,
+                    "category": "academic quality",
+                }
+            )
+        existing_titles.add(key)
+
+    def add_citation_issue(issue: str, severity: str, evidence: str, recommendation: str, excerpt: str = "") -> None:
+        key = issue.lower()
+        if key in existing_titles:
+            return
+        citation_issues.insert(
+            0,
+            {
+                "issue": issue,
+                "severity": severity,
+                "evidence": evidence,
+                "recommendation": recommendation,
+            },
+        )
+        suggestions.insert(
+            0,
+            {
+                "priority": severity,
+                "suggestion": recommendation,
+                "rationale": evidence,
+                "expected_impact": "Prevents the review from accepting unsupported or unverifiable source markers as evidence.",
+            },
+        )
+        if excerpt:
+            highlights.append(
+                {
+                    "excerpt": excerpt,
+                    "message": f"{issue}: {recommendation}",
+                    "severity": severity,
+                    "category": "citation verification",
+                }
+            )
+        existing_titles.add(key)
+
+    lines = text.splitlines()
+    body_lines_for_citations: List[str] = []
+    reference_lines: List[str] = []
+    in_references_for_citations = False
+    for line in lines:
+        if REFERENCE_HEADING_RE.match(line):
+            in_references_for_citations = True
+            continue
+        if in_references_for_citations:
+            reference_lines.append(line)
+        else:
+            body_lines_for_citations.append(line)
+
+    body_for_citations = "\n".join(body_lines_for_citations)
+    body_bracket_numbers = [int(value) for value in re.findall(r"\[(\d+)\]", body_for_citations)]
+    bracket_numbers = body_bracket_numbers or [int(value) for value in re.findall(r"\[(\d+)\]", text)]
+    has_references_heading = any(REFERENCE_HEADING_RE.match(line) for line in text.splitlines())
+    if bracket_numbers and not has_references_heading:
+        add_citation_issue(
+            "Bracket citations have no visible reference list",
+            "high",
+            f"Detected bracket citations {sorted(set(bracket_numbers))}, but no standalone References section was found.",
+            "Add complete reference entries for every bracket citation and verify that the cited sources actually exist.",
+            f"[{bracket_numbers[0]}]",
+        )
+
+    if has_references_heading:
+        reference_numbers = set()
+        reference_number_order: List[int] = []
+        incomplete_ref = ""
+        for line in reference_lines:
+            if not line.strip():
+                continue
+            ref_match = re.match(r"^\s*\[(\d+)\]\s+(.+)$", line.strip())
+            if ref_match:
+                reference_number = int(ref_match.group(1))
+                reference_numbers.add(reference_number)
+                reference_number_order.append(reference_number)
+                body = ref_match.group(2)
+                if not incomplete_ref and (len(body.split()) < 6 or not re.search(r"\b(19|20)\d{2}\b", body)):
+                    incomplete_ref = line.strip()
+        if reference_number_order and reference_number_order != list(range(1, len(reference_number_order) + 1)):
+            add_citation_issue(
+                "Reference list numbering is not sequential",
+                "high",
+                f"Detected reference entries numbered {reference_number_order}.",
+                "Renumber the References section sequentially as [1], [2], [3], and so on, matching first citation order.",
+                f"[{reference_number_order[-1]}]",
+            )
+        missing = sorted(set(bracket_numbers) - reference_numbers)
+        if missing:
+            add_citation_issue(
+                "Bracket citations lack matching reference entries",
+                "high",
+                f"In-text citation numbers {missing} do not have matching numbered entries in the References section.",
+                "Add the missing source metadata or remove unsupported citation markers.",
+                f"[{missing[0]}]",
+            )
+        if incomplete_ref:
+            add_citation_issue(
+                "Reference entry appears incomplete or placeholder-like",
+                "high",
+                f"Detected incomplete reference entry: {incomplete_ref[:160]}",
+                "Verify the source exists and provide complete author, title, publication, date, and retrieval details as required.",
+                incomplete_ref[:160],
+            )
+
+    if body_bracket_numbers:
+        first_seen: List[int] = []
+        for number in body_bracket_numbers:
+            if number not in first_seen:
+                first_seen.append(number)
+        expected = list(range(1, len(first_seen) + 1))
+        if first_seen != expected:
+            add_citation_issue(
+                "In-text citation numbers are not in first-appearance order",
+                "high",
+                f"Detected first appearances as {first_seen}. Repeated citations are allowed, but new citation numbers should appear as {expected}.",
+                "Use IEEE citation numbers in order of first appearance. Repeats like [1], [2], [1], [3] are valid; new out-of-order citations like [2], [1], [3] are not.",
+                f"[{first_seen[0]}]",
+            )
+
+    body_text = []
+    for line in text.splitlines():
+        if REFERENCE_HEADING_RE.match(line):
+            break
+        body_text.append(line)
+    body_for_claim_checks = "\n".join(body_text)
+
+    claim_pattern = re.compile(
+        r"[^.!?]*(?:improves?|enhances?|increases?|reduces?|causes?|leads to|beneficial tool|cognitive performance|academic performance)[^.!?]*[.!?]",
+        re.IGNORECASE,
+    )
+    citation_like = re.compile(r"\[\d+\]|\([A-Z][A-Za-z' -]+,\s*\d{4}[a-z]?\)")
+    for match in claim_pattern.finditer(body_for_claim_checks):
+        sentence = match.group(0).strip()
+        if sentence and not citation_like.search(sentence):
+            add_citation_issue(
+                "Evidence-based claim may need citation",
+                "high",
+                f"Detected an externally verifiable claim without a visible citation: {sentence[:180]}",
+                "Add a credible source or revise the sentence as an unsupported claim.",
+                sentence[:180],
+            )
+            break
+
+    abstract_match = re.search(
+        r"(?is)(?:^|\n)\s*#{0,6}\s*abstract\s*\n+(.+?)(?=\n\s*#{0,6}\s*(?:[IVX]+\.\s*)?introduction\b|\Z)",
+        body_for_claim_checks,
+    )
+    if abstract_match:
+        abstract_text = " ".join(abstract_match.group(1).split())
+        if re.search(r"\bbrief overview\b|\bprovides an overview\b|\btalks about\b|\bcontinued significance\b|\bvery old\b", abstract_text, re.IGNORECASE):
+            add_academic_issue(
+                "Abstract is generic",
+                "medium",
+                f"Detected a broad descriptive abstract: {abstract_text[:180]}",
+                "State the paper's specific focus, scope, and main takeaway instead of only saying it provides an overview.",
+                abstract_text[:180],
+            )
+
+    objective_match = re.search(r"(?i)\b(this paper|this study)\s+(?:provides|discusses|examines|explores|talks about)\b[^.!?]*[.!?]", body_for_claim_checks)
+    if objective_match:
+        add_academic_issue(
+            "Weak thesis or research contribution",
+            "high",
+            f"Detected a descriptive objective without a clear argument or contribution: {objective_match.group(0).strip()}",
+            "Add a focused thesis, research question, or contribution that explains what the paper adds beyond summary.",
+            objective_match.group(0).strip(),
+        )
+
+    body_sections = re.findall(r"(?im)^\s*[IVX]+\.\s+.+$", body_for_claim_checks)
+    if len(body_sections) >= 3 and not re.search(r"(?i)\btherefore|however|in contrast|this suggests|this demonstrates|because|as a result\b", body_for_claim_checks):
+        add_academic_issue(
+            "Writing is mostly descriptive",
+            "medium",
+            "The draft is organized as a sequence of historical facts but shows little analysis, synthesis, or argument.",
+            "Add analytical transitions that explain why each historical stage matters for the paper's central claim.",
+        )
+
+    reference_years = [int(year) for year in re.findall(r"(?m)^\s*\[\d+\].*?\b((?:18|19|20)\d{2})\b", text)]
+    old_reference_years = [year for year in reference_years if year < 1990]
+    if len(old_reference_years) >= max(2, len(reference_years) // 2):
+        add_academic_issue(
+            "Source base may be dated",
+            "medium",
+            f"Several references are older sources: {', '.join(str(year) for year in old_reference_years[:6])}.",
+            "Keep historically important sources, but add recent scholarship if the paper makes claims about current significance or modern chess.",
+        )
+
+    data["academic_quality_issues"] = academic_issues
+    data["citation_consistency_issues"] = citation_issues
+    data["prioritized_suggestions"] = suggestions
+    data["highlights"] = highlights
+    return data
+
+
 def coerce_analysis_shape(
     data: Dict[str, Any],
     text: str,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Dict[str, Any]:
     review_mode = normalize_review_mode(review_mode)
     required_list_fields = [
@@ -1332,22 +1716,62 @@ def coerce_analysis_shape(
         and str(item.get("excerpt", "")).strip()
         and str(item.get("message", "")).strip()
     ]
+    existing_highlight_keys = {str(item.get("excerpt", "")).strip().lower() for item in data["highlights"]}
+    for field in issue_fields:
+        for item in data[field]:
+            evidence = str(item.get("evidence", "")).strip()
+            issue = str(item.get("issue", "Review this excerpt")).strip()
+            recommendation = str(item.get("recommendation", "")).strip()
+            severity = str(item.get("severity", "medium")).strip() or "medium"
+            if not evidence or evidence.lower().startswith("no precise evidence"):
+                continue
+            excerpt = evidence
+            if len(excerpt) > 240:
+                sentence_match = re.search(r"[^.!?]{20,220}[.!?]", excerpt)
+                excerpt = sentence_match.group(0).strip() if sentence_match else excerpt[:240].strip()
+            key = excerpt.lower()
+            if key in existing_highlight_keys:
+                continue
+            data["highlights"].append(
+                {
+                    "excerpt": excerpt,
+                    "message": f"{issue}: {recommendation}" if recommendation else issue,
+                    "severity": severity,
+                    "category": issue,
+                }
+            )
+            existing_highlight_keys.add(key)
     data["source"] = "openai"
     data["fallback_used"] = False
     data["reviewed_text"] = text
 
     if review_mode == "format":
+        findings = deterministic_findings(text, format_mode=format_mode)
+        violation_count = (
+            len(findings["structure_format_issues"])
+            + len(findings["citation_consistency_issues"])
+        )
+        style_label = {"apa7": "APA 7", "ieee": "IEEE"}[normalize_format_mode(format_mode)]
+        data["summary"] = (
+            f"{style_label} format check found {violation_count} visible violation(s)."
+            if violation_count
+            else f"No visible {style_label} formatting or citation violations were detected by the rule-based checker."
+        )
+        data["structure_format_issues"] = findings["structure_format_issues"]
         data["academic_quality_issues"] = []
+        data["citation_consistency_issues"] = findings["citation_consistency_issues"]
+        data["prioritized_suggestions"] = findings["prioritized_suggestions"]
         data["optional_rewrite_suggestions"] = []
-        return merge_deterministic_findings(data, text, format_mode=format_mode)
-    return data
+        data["highlights"] = findings["highlights"]
+        return data
+    return merge_academic_safety_findings(data, text)
 
 
 def build_analysis_prompt(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> str:
     review_mode = normalize_review_mode(review_mode)
     if review_mode == "academic":
@@ -1364,13 +1788,23 @@ JSON keys required:
 - highlights (array of objects: excerpt, message, severity, category)
 
 Review priorities:
-- Explain how the paper sounds: clarity, academic tone, flow, coherence, concision, and precision.
-- Flag grammar, sentence construction, awkward wording, informal language, vague claims, repetition, and weak word choice.
-- Flag claims that appear to need citations, including factual assertions, statistics, attributed ideas, and broad research claims.
-- Identify organization problems such as weak transitions, unclear thesis, unsupported claims, or paragraphs without a clear purpose.
-- Suggest focused rewrites only for the clearest high-value examples.
-- Every issue must include concrete evidence copied or closely identified from the paper.
+- Do not look for errors just to fill the output. If there is no meaningful issue in a category, return an empty array.
+- Prioritize major academic risks over minor rewriting: unsupported claims, fake or unverifiable citations, missing reference entries, weak thesis/gap/objective, evidence mismatch, and unclear logic.
+- Treat bracket citations such as [1], [2], [3], [4] as unverified source markers unless the draft includes matching complete reference entries. Question whether the cited sources actually exist when metadata is missing, incomplete, or placeholder-like.
+- Flag claims that appear to need citations, including factual assertions, causal claims, statistics, attributed ideas, and broad research claims such as claims that chess improves cognitive performance.
+- For survey, history, overview, or background papers, check whether the paper has a clear thesis, research question, contribution, scope, and synthesis rather than only encyclopedic summary.
+- Flag a generic abstract when it only says the paper provides a brief overview without a specific argument, finding, scope, or takeaway.
+- Flag dated source bases when the paper relies heavily on old sources for current claims, while recognizing that old sources can still be valid primary or historical sources.
+- For introductions, judge only whether they provide enough background, establish a gap/problem, and state a clear objective. Do not demand detailed analysis inside the introduction.
+- Explain how the paper sounds only when there is a real clarity, tone, flow, grammar, concision, or precision problem.
+- Do not criticize acceptable academic wording merely because it could be rephrased. Avoid low-value comments about word choice when the phrase is clear and appropriate.
+- Never cite or quote a sentence that is not actually present in the submitted paper.
+- Suggest rewrites only for high-impact examples tied to a real issue.
+- Every issue must include exact concrete evidence copied from the paper.
+- Add a highlight for each meaningful issue using the exact shortest excerpt from the paper.
+- If multiple issues refer to the same phrase or sentence, reuse the same excerpt with a different message.
 - Do not invent sources, facts, quotations, or paper requirements.
+- Priority ranking should put citation/source validity and unsupported major claims before minor flow, wording, or style comments.
 - Prefer fewer useful findings over generic filler. Keep the summary under 120 words.
 
 Context metadata:
@@ -1398,6 +1832,8 @@ Constraints:
 - Check formatting conventions, in-text citations, references, citation/reference matching, table naming, and figure naming.
 - Do not invent issues just to fill categories.
 - Every issue must cite concrete evidence from the draft.
+- Add a highlight for each meaningful issue using the exact shortest excerpt from the draft.
+- If multiple issues refer to the same phrase or sentence, reuse the same excerpt with a different message.
 - If a category has no meaningful issue, return an empty array for that category.
 - academic_quality_issues must always be an empty array.
 - optional_rewrite_suggestions must always be an empty array.
@@ -1424,11 +1860,56 @@ Text to review:
 """
 
 
+def build_ollama_analysis_prompt(
+    text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
+) -> str:
+    review_mode = normalize_review_mode(review_mode)
+    if review_mode != "academic":
+        return build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)
+    return f"""
+Return one valid compact JSON object only. No markdown. No explanation outside JSON.
+
+Required JSON shape:
+{{
+  "summary": "one sentence under 45 words",
+  "structure_format_issues": [],
+  "academic_quality_issues": [
+    {{"issue":"", "severity":"high|medium|low", "evidence":"exact short quote from paper", "recommendation":""}}
+  ],
+  "citation_consistency_issues": [
+    {{"issue":"", "severity":"high|medium|low", "evidence":"exact short quote from paper", "recommendation":""}}
+  ],
+  "prioritized_suggestions": [
+    {{"priority":"high|medium|low", "suggestion":"", "rationale":"", "expected_impact":""}}
+  ],
+  "optional_rewrite_suggestions": [],
+  "highlights": []
+}}
+
+Rules:
+- Return at most 4 academic_quality_issues, at most 3 citation_consistency_issues, and at most 5 prioritized_suggestions.
+- Leave optional_rewrite_suggestions and highlights as empty arrays.
+- Do not invent issues. If no real issue exists, use an empty array.
+- Focus on major academic problems: generic abstract, weak thesis or contribution, descriptive/encyclopedic writing, unsupported claims, missing or mismatched references, dated source base, grammar/tone only if clearly weak.
+- Do not say IEEE citation numbering is inconsistent when citations are [1], [2], [3] in first-appearance order.
+- Every issue must use exact evidence that appears in the paper.
+
+Metadata:
+{json.dumps(metadata or {}, ensure_ascii=True)}
+
+Paper:
+{text}
+"""
+
+
 def parse_model_analysis(
     raw: str,
     text: str,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Dict[str, Any]:
     if not raw:
         raise ValueError("Empty response from selected model.")
@@ -1436,41 +1917,6 @@ def parse_model_analysis(
     if not isinstance(data, dict):
         raise ValueError("Selected model output is not a JSON object.")
     return coerce_analysis_shape(data, text, review_mode=review_mode, format_mode=format_mode)
-
-
-def repair_ollama_json(raw: str, model: str) -> str:
-    resp = requests.post(
-        f"{get_ollama_url()}/api/generate",
-        json={
-            "model": model,
-            "prompt": (
-                "Repair the JSON syntax in the text below. Preserve the existing meaning and keys. "
-                "Return ONLY one valid JSON object with no markdown or explanation.\n\n"
-                f"{raw}"
-            ),
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0},
-        },
-        timeout=90,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Ollama JSON repair failed with HTTP {resp.status_code}: {resp.text.strip()}")
-    return resp.json().get("response", "").strip()
-
-
-def parse_analysis_with_local_repair(
-    raw: str,
-    text: str,
-    model: str,
-    review_mode: str,
-    format_mode: str,
-) -> Dict[str, Any]:
-    try:
-        return parse_model_analysis(raw=raw, text=text, review_mode=review_mode, format_mode=format_mode)
-    except json.JSONDecodeError:
-        repaired = repair_ollama_json(raw=raw, model=model)
-        return parse_model_analysis(raw=repaired, text=text, review_mode=review_mode, format_mode=format_mode)
 
 
 def json_line(event: str, payload: Dict[str, Any]) -> str:
@@ -1502,6 +1948,7 @@ def remember_paper_context(
         f"Review findings: {issue_context}\n"
         f"Paper text:\n{text[:12000]}"
     )
+    state["paper_sections"] = extract_paper_sections(text)
 
 
 
@@ -1530,11 +1977,13 @@ def chat(req: ChatRequest) -> ChatResponse:
     message = req.message.strip()
     state["history"].append({"role": "user", "content": message})
     state["history"] = state["history"][-12:]
+    focused_section = find_requested_section(message, state.get("paper_sections", []))
     try:
         reply = call_assistant_chat(
             state["history"],
             model_override=req.model,
             paper_context=state.get("paper_context"),
+            focused_section=focused_section,
         )
     except Exception:
         state["history"].pop()
@@ -1545,7 +1994,12 @@ def chat(req: ChatRequest) -> ChatResponse:
         phase="chat",
         questions=[],
         next_prompt=reply,
-        context={"paper_context_available": bool(state.get("paper_context"))},
+        context={
+            "paper_context_available": bool(state.get("paper_context")),
+            "focused_section": focused_section.get("title") if focused_section else None,
+            "focused_section_found": bool(focused_section and focused_section.get("content")),
+            "focused_section_text": focused_section.get("content", "") if focused_section else "",
+        },
     )
 
 
@@ -1558,10 +2012,10 @@ def analyze_text(req: AnalyzeTextRequest) -> AnalysisResponse:
         text=text,
         metadata=req.metadata,
         model_override=req.model,
-        review_mode=req.review_mode or "format",
-        format_mode=req.format_mode or "apa7",
+        review_mode=req.review_mode or "academic",
+        format_mode=req.format_mode or "ieee",
     )
-    remember_paper_context(req.session_id, text, data, req.review_mode or "format", req.format_mode or "apa7")
+    remember_paper_context(req.session_id, text, data, req.review_mode or "academic", req.format_mode or "ieee")
     return AnalysisResponse(**data)
 
 
@@ -1573,8 +2027,8 @@ def analyze_text_stream(req: AnalyzeTextStreamRequest) -> StreamingResponse:
             metadata=req.metadata,
             model_override=req.model,
             session_id=req.session_id,
-            review_mode=req.review_mode or "format",
-            format_mode=req.format_mode or "apa7",
+            review_mode=req.review_mode or "academic",
+            format_mode=req.format_mode or "ieee",
         ),
         media_type="application/x-ndjson",
     )
@@ -1585,8 +2039,8 @@ async def analyze_docx(
     file: UploadFile = File(...),
     session_id: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    review_mode: str = Form("format"),
-    format_mode: str = Form("apa7"),
+    review_mode: str = Form("academic"),
+    format_mode: str = Form("ieee"),
 ) -> AnalysisResponse:
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported.")
@@ -1611,8 +2065,8 @@ async def analyze_docx_stream(
     file: UploadFile = File(...),
     session_id: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    review_mode: str = Form("format"),
-    format_mode: str = Form("apa7"),
+    review_mode: str = Form("academic"),
+    format_mode: str = Form("ieee"),
 ) -> StreamingResponse:
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported.")
@@ -1699,15 +2153,24 @@ def call_model_for_analysis(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Dict[str, Any]:
     model = get_analysis_model(model_override)
     review_mode = normalize_review_mode(review_mode)
     format_mode = normalize_format_mode(format_mode)
-    prompt = build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)
+    if review_mode == "format":
+        analysis = coerce_analysis_shape(
+            {"summary": "Rule-based format check completed."},
+            text,
+            review_mode=review_mode,
+            format_mode=format_mode,
+        )
+        analysis["source"] = "rules"
+        return analysis
 
     if not is_openai_model(model):
+        prompt = build_ollama_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)
         resp = requests.post(
             f"{get_ollama_url()}/api/generate",
             json={
@@ -1715,23 +2178,18 @@ def call_model_for_analysis(
                 "prompt": prompt,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.2},
+                "options": ollama_options("analysis"),
             },
-            timeout=90,
+            timeout=get_ollama_timeout(),
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"Ollama request failed with HTTP {resp.status_code}: {resp.text.strip()}")
         raw = resp.json().get("response", "").strip()
-        analysis = parse_analysis_with_local_repair(
-            raw=raw,
-            text=text,
-            model=model,
-            review_mode=review_mode,
-            format_mode=format_mode,
-        )
+        analysis = parse_model_analysis(raw=raw, text=text, review_mode=review_mode, format_mode=format_mode)
         analysis["source"] = "ollama"
         return analysis
 
+    prompt = build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode)
     body = {
         "model": openai_model_id(model),
         "messages": [{"role": "user", "content": prompt}],
@@ -1759,8 +2217,8 @@ def analyze_text_with_resilience(
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Dict[str, Any]:
     try:
         return call_model_for_analysis(
@@ -1782,8 +2240,8 @@ def analysis_event_stream(
     metadata: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
     session_id: Optional[str] = None,
-    review_mode: str = "format",
-    format_mode: str = "apa7",
+    review_mode: str = "academic",
+    format_mode: str = "ieee",
 ) -> Generator[str, None, None]:
     try:
         model = get_analysis_model(model_override)
@@ -1792,6 +2250,25 @@ def analysis_event_stream(
         yield json_line("status", {"step": "Validating input", "detail": "Checking draft length and selected model."})
         if len(text.strip()) < 20:
             yield json_line("error", {"detail": "Text too short for meaningful analysis."})
+            return
+
+        if review_mode == "format":
+            yield json_line(
+                "status",
+                {
+                    "step": "Running rule-based format checker",
+                    "detail": "Checking visible APA/IEEE formatting and citation rules without contacting an AI model.",
+                },
+            )
+            analysis = coerce_analysis_shape(
+                {"summary": "Rule-based format check completed."},
+                text,
+                review_mode=review_mode,
+                format_mode=format_mode,
+            )
+            analysis["source"] = "rules"
+            remember_paper_context(session_id, text, analysis, review_mode, format_mode)
+            yield json_line("analysis", {"analysis": analysis})
             return
 
         provider = "OpenAI" if is_openai_model(model) else "Ollama"
@@ -1826,12 +2303,13 @@ def analysis_event_stream(
             headers = {}
             body = {
                 "model": model,
-                "prompt": build_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode),
+                "prompt": build_ollama_analysis_prompt(text=text, metadata=metadata, review_mode=review_mode, format_mode=format_mode),
                 "stream": True,
                 "format": "json",
-                "options": {"temperature": 0.2},
+                "options": ollama_options("analysis"),
             }
-        with requests.post(url, headers=headers, json=body, timeout=90, stream=True) as resp:
+        request_timeout = 90 if is_openai_model(model) else get_ollama_timeout()
+        with requests.post(url, headers=headers, json=body, timeout=request_timeout, stream=True) as resp:
             if resp.status_code >= 400:
                 raise RuntimeError(f"{provider} request failed with HTTP {resp.status_code}: {resp.text.strip()}")
             for line in resp.iter_lines(decode_unicode=True):
@@ -1851,13 +2329,17 @@ def analysis_event_stream(
                 if piece:
                     raw_parts.append(piece)
                     chunk_count += 1
-                    if chunk_count == 1 or chunk_count % 12 == 0:
+                    if chunk_count == 1 or chunk_count % 100 == 0:
                         yield json_line(
                             "status",
                             {
                                 "step": f"Receiving {provider} output",
                                 "detail": f"{provider} has streamed {chunk_count} response chunks.",
                             },
+                        )
+                    if not is_openai_model(model) and chunk_count > 3000:
+                        raise RuntimeError(
+                            "Ollama exceeded the local output limit before completing a valid analysis."
                         )
                 if not is_openai_model(model) and payload.get("done"):
                     break
@@ -1879,18 +2361,17 @@ def analysis_event_stream(
                     review_mode=review_mode,
                     format_mode=format_mode,
                 )
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
                 yield json_line(
                     "status",
                     {
-                        "step": "Repairing local model output",
-                        "detail": "Gemma returned malformed JSON. Asking the local model to repair the structured response.",
+                        "step": "Using deterministic academic fallback",
+                        "detail": "Gemma returned malformed JSON, so the backend is using rule-based academic checks.",
                     },
                 )
-                analysis = parse_analysis_with_local_repair(
-                    raw=raw,
+                analysis = fallback_analysis(
                     text=text,
-                    model=model,
+                    reason=f"JSONDecodeError: {exc}",
                     review_mode=review_mode,
                     format_mode=format_mode,
                 )

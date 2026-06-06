@@ -1,14 +1,15 @@
 :root {
-  --ink: #18211f;
-  --muted: #5d6965;
-  --paper: #f7f5ee;
-  --panel: #fffdf7;
-  --line: #d8d2c3;
-  --accent: #2d6a57;
-  --accent-strong: #1f4f41;
-  --warn: #9a4d24;
-  --danger: #9f2f2f;
-  --shadow: 0 18px 50px rgba(35, 43, 38, 0.14);
+  --ink: #edf4ef;
+  --muted: #a7b5ad;
+  --paper: #0d1210;
+  --panel: #151c19;
+  --panel-soft: #1b2420;
+  --line: #2d3a35;
+  --accent: #47c08d;
+  --accent-strong: #7ee0b5;
+  --warn: #f0ad63;
+  --danger: #ff7b7b;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
 }
 
 * {
@@ -21,9 +22,9 @@ body {
   color: var(--ink);
   font-family: "IBM Plex Sans", sans-serif;
   background:
-    linear-gradient(120deg, rgba(45, 106, 87, 0.13), transparent 34%),
-    linear-gradient(300deg, rgba(154, 77, 36, 0.12), transparent 38%),
-    repeating-linear-gradient(0deg, rgba(24, 33, 31, 0.035) 0 1px, transparent 1px 32px),
+    linear-gradient(120deg, rgba(71, 192, 141, 0.12), transparent 34%),
+    linear-gradient(300deg, rgba(240, 173, 99, 0.1), transparent 38%),
+    repeating-linear-gradient(0deg, rgba(237, 244, 239, 0.035) 0 1px, transparent 1px 32px),
     var(--paper);
 }
 
@@ -70,7 +71,7 @@ button {
   min-height: 42px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgba(255, 253, 247, 0.9);
+  background: rgba(21, 28, 25, 0.95);
   color: var(--ink);
   padding: 0 10px;
   font: inherit;
@@ -80,7 +81,7 @@ button {
 
 .model-switch select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(45, 106, 87, 0.12);
+  box-shadow: 0 0 0 3px rgba(71, 192, 141, 0.14);
 }
 
 .eyebrow {
@@ -119,7 +120,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 10px 14px;
-  background: rgba(255, 253, 247, 0.75);
+  background: rgba(21, 28, 25, 0.8);
   color: var(--muted);
   text-align: center;
   box-shadow: 0 8px 24px rgba(35, 43, 38, 0.08);
@@ -144,7 +145,7 @@ h3 {
 .review-panel {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(255, 253, 247, 0.86);
+  background: rgba(21, 28, 25, 0.9);
   box-shadow: var(--shadow);
   backdrop-filter: blur(8px);
 }
@@ -187,7 +188,7 @@ h3 {
 .tab.active {
   border-color: var(--accent);
   color: var(--accent-strong);
-  background: rgba(45, 106, 87, 0.08);
+  background: rgba(71, 192, 141, 0.12);
 }
 
 .tabs {
@@ -210,7 +211,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 12px 13px;
-  background: #fffaf0;
+  background: var(--panel-soft);
   line-height: 1.42;
 }
 
@@ -220,8 +221,8 @@ h3 {
 
 .message.user {
   align-self: flex-end;
-  border-color: rgba(45, 106, 87, 0.28);
-  background: rgba(45, 106, 87, 0.1);
+  border-color: rgba(71, 192, 141, 0.38);
+  background: rgba(71, 192, 141, 0.14);
 }
 
 .message.error {
@@ -258,6 +259,7 @@ h3 {
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
   gap: 10px;
   padding: 14px;
   border-top: 1px solid var(--line);
@@ -268,7 +270,7 @@ textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #fffdf7;
+  background: #101613;
   color: var(--ink);
   outline: none;
 }
@@ -285,10 +287,21 @@ textarea {
   line-height: 1.55;
 }
 
+#chatInput {
+  box-sizing: border-box;
+  height: 44px;
+  min-height: 44px;
+  max-height: 120px;
+  resize: none;
+  overflow-y: auto;
+  padding: 10px 12px;
+  line-height: 1.35;
+}
+
 input:focus,
 textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(45, 106, 87, 0.12);
+  box-shadow: 0 0 0 3px rgba(71, 192, 141, 0.14);
 }
 
 .composer button,
@@ -299,6 +312,21 @@ textarea:focus {
   font-weight: 700;
 }
 
+.composer button {
+  height: 44px;
+  min-height: 44px;
+  align-self: end;
+}
+
+.message code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ink);
+  font-family: Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
 .primary-action {
   background: var(--accent);
   color: white;
@@ -307,7 +335,7 @@ textarea:focus {
 .secondary-action {
   min-height: 46px;
   border: 1px solid var(--accent);
-  background: rgba(45, 106, 87, 0.08);
+  background: rgba(71, 192, 141, 0.12);
   color: var(--accent-strong);
 }
 
@@ -317,7 +345,7 @@ textarea:focus {
 }
 
 .secondary-action:hover {
-  background: rgba(45, 106, 87, 0.16);
+  background: rgba(71, 192, 141, 0.2);
 }
 
 .analysis-form {
@@ -342,7 +370,7 @@ textarea:focus {
   place-items: center;
   border: 1px dashed var(--accent);
   border-radius: 8px;
-  background: rgba(45, 106, 87, 0.07);
+  background: rgba(71, 192, 141, 0.08);
   color: var(--accent-strong);
   font-weight: 700;
 }
@@ -357,7 +385,7 @@ textarea:focus {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 16px;
-  background: rgba(255, 250, 240, 0.7);
+  background: rgba(27, 36, 32, 0.72);
   color: var(--muted);
 }
 
@@ -365,8 +393,8 @@ textarea:focus {
   display: flex;
   align-items: center;
   gap: 14px;
-  border-color: rgba(45, 106, 87, 0.35);
-  background: rgba(45, 106, 87, 0.08);
+  border-color: rgba(71, 192, 141, 0.35);
+  background: rgba(71, 192, 141, 0.1);
 }
 
 .result-state .mark,
@@ -430,7 +458,7 @@ textarea:focus {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 16px;
-  background: #fffdf7;
+  background: var(--panel-soft);
 }
 
 .result-card p {
@@ -453,7 +481,7 @@ textarea:focus {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 14px;
-  background: #fffaf0;
+  background: #101613;
   color: var(--ink);
   line-height: 1.65;
   white-space: pre-wrap;
@@ -478,8 +506,14 @@ textarea:focus {
 }
 
 .text-highlight.low {
-  border-bottom-color: rgba(45, 106, 87, 0.8);
-  background: rgba(45, 106, 87, 0.12);
+  border-bottom-color: rgba(71, 192, 141, 0.8);
+  background: rgba(71, 192, 141, 0.12);
+}
+
+.text-highlight.focus {
+  border-bottom: 2px solid var(--accent);
+  background: transparent;
+  box-shadow: inset 0 -0.45em 0 rgba(71, 192, 141, 0.16);
 }
 
 .text-highlight::after {
@@ -492,7 +526,7 @@ textarea:focus {
   border-radius: 6px;
   padding: 9px 10px;
   background: var(--ink);
-  color: #fffdf7;
+  color: var(--paper);
   box-shadow: 0 10px 24px rgba(35, 43, 38, 0.22);
   content: attr(data-message);
   font-size: 0.86rem;

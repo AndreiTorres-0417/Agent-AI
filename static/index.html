@@ -10,14 +10,13 @@
       href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@500;650&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260602-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260605-1" />
   </head>
   <body>
     <main class="shell">
       <section class="topbar" aria-label="Application status">
         <div>
-          <p class="eyebrow">Academic Review MVP</p>
-          <h1>Chat, upload, and get structured feedback.</h1>
+          <h1>Academic Review Agent</h1>
         </div>
         <div class="top-controls">
           <label class="model-switch" for="modelSelect">
@@ -25,20 +24,6 @@
             <select id="modelSelect">
               <option value="openai:gpt-4.1-mini">OpenAI GPT-4.1 mini</option>
               <option value="gemma3:1b">Local Gemma 3 1B</option>
-            </select>
-          </label>
-          <label class="model-switch" for="reviewModeSelect">
-            <span>Review Mode</span>
-            <select id="reviewModeSelect">
-              <option value="format">Format Checker</option>
-              <option value="academic">General Academic Review</option>
-            </select>
-          </label>
-          <label class="model-switch" id="formatControl" for="formatSelect">
-            <span>Format Style</span>
-            <select id="formatSelect">
-              <option value="apa7">APA 7</option>
-              <option value="ieee">IEEE</option>
             </select>
           </label>
           <div class="status-pill" id="healthStatus">Checking API...</div>
@@ -49,8 +34,7 @@
         <aside class="chat-panel" aria-label="Academic paper assistant chat">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">Step 1</p>
-              <h2>Academic Paper Assistant</h2>
+              <h2>Review Discussion</h2>
             </div>
             <button class="ghost-button" id="resetBtn" type="button">Reset</button>
           </div>
@@ -58,13 +42,13 @@
           <div class="messages" id="messages" aria-live="polite"></div>
 
           <form class="composer" id="chatForm">
-            <input
+            <textarea
               id="chatInput"
-              type="text"
               autocomplete="off"
               placeholder="Ask about your academic paper..."
+              rows="1"
               required
-            />
+            ></textarea>
             <button type="submit">Send</button>
           </form>
         </aside>
@@ -72,8 +56,7 @@
         <section class="review-panel" aria-label="Document review">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">Step 2</p>
-              <h2>Review Draft</h2>
+              <h2>Draft Review</h2>
             </div>
             <div class="tabs" role="tablist" aria-label="Input mode">
               <button class="tab active" id="textTab" type="button">Text</button>
@@ -100,7 +83,7 @@
 
           <div class="result-state" id="resultState">
             <span class="mark">Ready</span>
-            <p>Paste text into chat or use the review panel.</p>
+            <p>Analyze a draft, then discuss the results with the assistant.</p>
           </div>
 
           <div class="thinking hidden" id="thinkingStatus" aria-live="polite">
@@ -120,6 +103,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260605-1"></script>
   </body>
 </html>

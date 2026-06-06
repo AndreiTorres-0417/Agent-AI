@@ -1,4 +1,19 @@
-let sessionId = `session-${Date.now()}`;
+const storageKeys = {
+  sessionId: "academicReview.sessionId",
+  messages: "academicReview.messages",
+  model: "academicReview.model",
+  reviewMode: "academicReview.reviewMode",
+  formatMode: "academicReview.formatMode",
+  draftText: "academicReview.draftText",
+  inputMode: "academicReview.inputMode",
+  fileName: "academicReview.fileName",
+};
+
+let sessionId = localStorage.getItem(storageKeys.sessionId) || `session-${Date.now()}`;
+localStorage.setItem(storageKeys.sessionId, sessionId);
+let messageHistory = [];
+let latestAnalysis = null;
+let chatFocusHighlight = null;
 
 const messages = document.querySelector("#messages");
 const chatForm = document.querySelector("#chatForm");
@@ -6,9 +21,6 @@ const chatInput = document.querySelector("#chatInput");
 const resetBtn = document.querySelector("#resetBtn");
 const healthStatus = document.querySelector("#healthStatus");
 const modelSelect = document.querySelector("#modelSelect");
-const reviewModeSelect = document.querySelector("#reviewModeSelect");
-const formatControl = document.querySelector("#formatControl");
-const formatSelect = document.querySelector("#formatSelect");
 const textTab = document.querySelector("#textTab");
 const docxTab = document.querySelector("#docxTab");
 const textForm = document.querySelector("#textForm");
@@ -21,24 +33,36 @@ const thinkingStatus = document.querySelector("#thinkingStatus");
 const thinkingStep = document.querySelector("#thinkingStep");
 const thinkingDetail = document.querySelector("#thinkingDetail");
 const results = document.querySelector("#results");
+const welcomeMessage = "Analyze a draft on the right, then ask me about the summary, issues, citations, or how to revise it.";
+
+function saveMessages() {
+  localStorage.setItem(storageKeys.messages, JSON.stringify(messageHistory.slice(-80)));
+}
+
+function saveSettings() {
+  localStorage.setItem(storageKeys.model, selectedModel());
+}
 
 function selectedModel() {
   return modelSelect.value;
 }
 
 function selectedFormat() {
-  return formatSelect.value;
+  return "ieee";
 }
 
 function selectedReviewMode() {
-  return reviewModeSelect.value;
+  return "academic";
 }
 
 function renderInlineMarkdown(value) {
-  return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  return escapeHtml(value)
+    .replace(/`([^`]+?)`/g, "<code>$1</code>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>");
 }
 
-function renderAssistantMarkdown(value) {
+function renderBasicMarkdown(value) {
   const normalized = String(value ?? "").replace(/\s+(?=\d+\.\s+\*\*)/g, "\n");
   const lines = normalized.split(/\r?\n/);
   const html = [];
@@ -78,16 +102,20 @@ function renderAssistantMarkdown(value) {
   return html.join("");
 }
 
-function addMessage(role, text, isError = false) {
+function addMessage(role, text, isError = false, persist = true) {
   const node = document.createElement("div");
   node.className = `message ${role}${isError ? " error" : ""}`;
-  if (role === "agent" && !isError) {
-    node.innerHTML = renderAssistantMarkdown(text);
+  if (!isError) {
+    node.innerHTML = renderBasicMarkdown(text);
   } else {
     node.textContent = text;
   }
   messages.appendChild(node);
   messages.scrollTop = messages.scrollHeight;
+  if (persist) {
+    messageHistory.push({ role, text, isError });
+    saveMessages();
+  }
 }
 
 function setBusy(label) {
@@ -114,10 +142,61 @@ function stopThinking(hide = true) {
   }
 }
 
+function resizeChatInput() {
+  chatInput.style.height = "auto";
+  chatInput.style.height = `${Math.min(chatInput.scrollHeight, 120)}px`;
+}
+
 function setReady(label, detail) {
   stopThinking();
   resultState.classList.remove("hidden");
   resultState.innerHTML = `<span class="mark">${label}</span><p>${detail}</p>`;
+}
+
+function clearLocalState() {
+  [
+    storageKeys.sessionId,
+    storageKeys.messages,
+    storageKeys.draftText,
+    storageKeys.inputMode,
+    storageKeys.fileName,
+  ].forEach((key) => localStorage.removeItem(key));
+  sessionId = `session-${Date.now()}`;
+  localStorage.setItem(storageKeys.sessionId, sessionId);
+  messageHistory = [];
+  messages.innerHTML = "";
+  draftText.value = "";
+  docxFile.value = "";
+  fileLabel.textContent = "Choose a .docx file";
+  results.innerHTML = "";
+  results.classList.add("hidden");
+  setReady("Cleared", "Chat history and saved draft text were cleared.");
+  addMessage("agent", welcomeMessage);
+}
+
+function restoreState() {
+  modelSelect.value = localStorage.getItem(storageKeys.model) || modelSelect.value;
+  draftText.value = localStorage.getItem(storageKeys.draftText) || "";
+  fileLabel.textContent = localStorage.getItem(storageKeys.fileName) || "Choose a .docx file";
+
+  const savedMode = localStorage.getItem(storageKeys.inputMode);
+  if (savedMode === "docx") {
+    switchMode("docx");
+  } else {
+    switchMode("text");
+  }
+
+  try {
+    messageHistory = JSON.parse(localStorage.getItem(storageKeys.messages) || "[]");
+  } catch {
+    messageHistory = [];
+  }
+  messages.innerHTML = "";
+  if (messageHistory.length) {
+    messageHistory.forEach((item) => addMessage(item.role, item.text, item.isError, false));
+  } else {
+    addMessage("agent", welcomeMessage);
+  }
 }
 
 function escapeHtml(value) {
@@ -172,6 +251,7 @@ async function apiStream(path, options = {}, handlers = {}) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastAnalysis = null;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -191,6 +271,7 @@ async function apiStream(path, options = {}, handlers = {}) {
         handlers.status(event);
       }
       if (event.event === "analysis" && handlers.analysis) {
+        lastAnalysis = event.analysis;
         handlers.analysis(event.analysis);
       }
       if (event.event === "error") {
@@ -199,6 +280,7 @@ async function apiStream(path, options = {}, handlers = {}) {
       }
     }
   }
+  return lastAnalysis;
 }
 
 async function checkHealth() {
@@ -217,6 +299,10 @@ async function checkHealth() {
 }
 
 async function sendChat(message) {
+  if (message.trim().toLowerCase() === "/clear") {
+    clearLocalState();
+    return;
+  }
   addMessage("user", message);
   const data = await apiJson("/chat", {
     method: "POST",
@@ -229,6 +315,16 @@ async function sendChat(message) {
     }),
   });
   addMessage("agent", data.next_prompt);
+  if (data.context?.focused_section_found && data.context.focused_section_text) {
+    chatFocusHighlight = {
+      excerpt: data.context.focused_section_text,
+      message: `Chat is analyzing: ${data.context.focused_section || "selected section"}`,
+      severity: "focus",
+    };
+    if (latestAnalysis) {
+      renderResults(latestAnalysis);
+    }
+  }
   if (data.analysis) {
     stopThinking();
     renderResults(data.analysis);
@@ -279,23 +375,38 @@ function renderHighlightedText(text, highlights = []) {
   });
 
   matches.sort((a, b) => a.start - b.start || b.end - a.end);
-  const filtered = [];
-  let cursor = -1;
+  const merged = [];
   for (const match of matches) {
-    if (match.start < cursor) continue;
-    filtered.push(match);
-    cursor = match.end;
+    const last = merged[merged.length - 1];
+    if (last && match.start <= last.end) {
+      last.end = Math.max(last.end, match.end);
+      last.text = text.slice(last.start, last.end);
+      last.messages.push(match.message);
+      last.severities.push(match.severity);
+      continue;
+    }
+    merged.push({
+      ...match,
+      messages: [match.message],
+      severities: [match.severity],
+    });
   }
 
-  if (!filtered.length) {
+  if (!merged.length) {
     return "";
   }
 
+  const severityRank = { focus: 4, high: 3, medium: 2, low: 1 };
+
   let html = "";
   let pos = 0;
-  filtered.forEach((match) => {
+  merged.forEach((match) => {
+    const severity = match.severities.reduce((best, current) => (
+      (severityRank[current] || 0) > (severityRank[best] || 0) ? current : best
+    ), "low");
+    const message = [...new Set(match.messages)].join(" | ");
     html += escapeHtml(text.slice(pos, match.start));
-    html += `<mark class="text-highlight ${escapeHtml(match.severity)}" tabindex="0" data-message="${escapeHtml(match.message)}">${escapeHtml(match.text)}</mark>`;
+    html += `<mark class="text-highlight ${escapeHtml(severity)}" tabindex="0" data-message="${escapeHtml(message)}">${escapeHtml(match.text)}</mark>`;
     pos = match.end;
   });
   html += escapeHtml(text.slice(pos));
@@ -303,7 +414,7 @@ function renderHighlightedText(text, highlights = []) {
   return `
     <article class="result-card">
       <h3>Highlighted Draft</h3>
-      <p>Hover or focus highlighted phrases to see why they were flagged.</p>
+      <p>Hover or focus highlighted phrases to see why they were flagged or what the chat is referencing.</p>
       <div class="highlighted-text">${html}</div>
     </article>
   `;
@@ -338,6 +449,31 @@ function renderRewrites(items) {
     )
     .join("");
   return `<article class="result-card"><h3>Rewrite Examples</h3><div class="issue-list">${body}</div></article>`;
+}
+
+function firstIssueTitle(items) {
+  const item = (items || []).find((entry) => String(entry?.issue || entry?.suggestion || "").trim());
+  return item ? String(item.issue || item.suggestion).trim() : "";
+}
+
+function buildReviewDiscussionPrompt(data) {
+  const mode = selectedReviewMode() === "format" ? "format check" : "academic review";
+  const focus =
+    firstIssueTitle(data.academic_quality_issues) ||
+    firstIssueTitle(data.structure_format_issues) ||
+    firstIssueTitle(data.citation_consistency_issues) ||
+    firstIssueTitle(data.prioritized_suggestions);
+  const focusLine = focus ? `The first thing I would discuss is: **${focus}**.` : "No major issue stood out in the structured results.";
+  return `I finished the ${mode}. **Summary:** ${data.summary}\n\n${focusLine}\n\nAsk me what to fix first, how to rewrite a section, or why a citation/wording issue matters.`;
+}
+
+function handleAnalysisResult(data) {
+  if (!data || data._discussionPosted) return;
+  data._discussionPosted = true;
+  latestAnalysis = data;
+  chatFocusHighlight = null;
+  renderResults(data);
+  addMessage("agent", buildReviewDiscussionPrompt(data));
 }
 
 function renderFormatResults(data) {
@@ -426,6 +562,7 @@ async function downloadIeeeDocx(text) {
 }
 
 function renderResults(data) {
+  latestAnalysis = data;
   stopThinking();
   resultState.classList.add("hidden");
   results.classList.remove("hidden");
@@ -438,7 +575,7 @@ function renderResults(data) {
       <p>${escapeHtml(data.summary)}</p>
       ${fallbackNote}
     </article>
-    ${renderHighlightedText(data.reviewed_text, data.highlights)}
+    ${renderHighlightedText(data.reviewed_text, [...(data.highlights || []), ...(chatFocusHighlight ? [chatFocusHighlight] : [])])}
     ${renderSection(selectedReviewMode() === "format" ? "Formatting Violations" : "Structure / Writing Issues", data.structure_format_issues, "No issues detected.")}
     ${renderSection("Academic Quality Issues", data.academic_quality_issues, "No academic quality issues detected.")}
     ${renderSection(selectedReviewMode() === "format" ? "Citation / Reference Violations" : "Citation Needs", data.citation_consistency_issues, "No citation issues detected.")}
@@ -460,6 +597,7 @@ chatForm.addEventListener("submit", async (event) => {
   const message = chatInput.value.trim();
   if (!message) return;
   chatInput.value = "";
+  resizeChatInput();
   try {
     await sendChat(message);
   } catch (error) {
@@ -468,32 +606,41 @@ chatForm.addEventListener("submit", async (event) => {
   }
 });
 
-resetBtn.addEventListener("click", () => {
-  sessionId = `session-${Date.now()}`;
-  messages.innerHTML = "";
-  addMessage("agent", "Ask me about your academic paper. I can help with planning, structure, citations, revisions, APA 7, and IEEE.");
-  setReady("Ready", "Paste text into chat or use the review panel.");
+chatInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    chatForm.requestSubmit();
+  }
 });
 
-textTab.addEventListener("click", () => switchMode("text"));
-docxTab.addEventListener("click", () => switchMode("docx"));
+chatInput.addEventListener("input", resizeChatInput);
+
+resetBtn.addEventListener("click", () => {
+  clearLocalState();
+});
+
+textTab.addEventListener("click", () => {
+  switchMode("text");
+  localStorage.setItem(storageKeys.inputMode, "text");
+});
+docxTab.addEventListener("click", () => {
+  switchMode("docx");
+  localStorage.setItem(storageKeys.inputMode, "docx");
+});
 
 docxFile.addEventListener("change", () => {
   fileLabel.textContent = docxFile.files[0]?.name || "Choose a .docx file";
+  localStorage.setItem(storageKeys.fileName, fileLabel.textContent);
 });
 
-formatSelect.addEventListener("change", () => {
-  setReady("Format Style Updated", `Format checks will now use ${formatSelect.options[formatSelect.selectedIndex].text} rules.`);
+modelSelect.addEventListener("change", () => {
+  saveSettings();
+  checkHealth();
 });
-reviewModeSelect.addEventListener("change", () => {
-  const formatMode = selectedReviewMode() === "format";
-  formatControl.classList.toggle("hidden", !formatMode);
-  setReady(
-    "Review Mode Updated",
-    formatMode ? "The analyzer will check formatting and reference-style violations." : "The analyzer will review writing quality, grammar, clarity, and citation needs.",
-  );
+
+draftText.addEventListener("input", () => {
+  localStorage.setItem(storageKeys.draftText, draftText.value);
 });
-modelSelect.addEventListener("change", checkHealth);
 
 textForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -503,8 +650,10 @@ textForm.addEventListener("submit", async (event) => {
     return;
   }
   setBusy("Analyzing Text");
+  saveSettings();
+  localStorage.setItem(storageKeys.draftText, draftText.value);
   try {
-    await apiStream(
+    const analysis = await apiStream(
       "/analyze_text_stream",
       {
         method: "POST",
@@ -519,9 +668,10 @@ textForm.addEventListener("submit", async (event) => {
       },
       {
         status: (event) => updateThinking(event.step, event.detail),
-        analysis: renderResults,
+        analysis: handleAnalysisResult,
       },
     );
+    handleAnalysisResult(analysis);
   } catch (error) {
     setReady("Analysis Failed", error.message);
   }
@@ -541,8 +691,9 @@ docxForm.addEventListener("submit", async (event) => {
   formData.append("review_mode", selectedReviewMode());
   formData.append("format_mode", selectedFormat());
   setBusy("Analyzing DOCX");
+  saveSettings();
   try {
-    await apiStream(
+    const analysis = await apiStream(
       "/analyze_docx_stream",
       {
         method: "POST",
@@ -550,13 +701,14 @@ docxForm.addEventListener("submit", async (event) => {
       },
       {
         status: (event) => updateThinking(event.step, event.detail),
-        analysis: renderResults,
+        analysis: handleAnalysisResult,
       },
     );
+    handleAnalysisResult(analysis);
   } catch (error) {
     setReady("Analysis Failed", error.message);
   }
 });
 
-addMessage("agent", "Ask me about your academic paper. I can help with planning, structure, citations, revisions, APA 7, and IEEE.");
+restoreState();
 checkHealth();
