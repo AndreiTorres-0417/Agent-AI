@@ -14,6 +14,7 @@ localStorage.setItem(storageKeys.sessionId, sessionId);
 let messageHistory = [];
 let latestAnalysis = null;
 let chatFocusHighlight = null;
+let chatThinkingNode = null;
 
 const messages = document.querySelector("#messages");
 const chatForm = document.querySelector("#chatForm");
@@ -115,6 +116,26 @@ function addMessage(role, text, isError = false, persist = true) {
   if (persist) {
     messageHistory.push({ role, text, isError });
     saveMessages();
+  }
+}
+
+function setChatThinking(step, detail) {
+  if (!chatThinkingNode) {
+    chatThinkingNode = document.createElement("div");
+    chatThinkingNode.className = "message agent chat-thinking";
+    messages.appendChild(chatThinkingNode);
+  }
+  chatThinkingNode.innerHTML = `
+    <span class="chat-thinking-step">${escapeHtml(step || "Working")}</span>
+    <p>${escapeHtml(detail || "Processing your question.")}</p>
+  `;
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function clearChatThinking() {
+  if (chatThinkingNode) {
+    chatThinkingNode.remove();
+    chatThinkingNode = null;
   }
 }
 
@@ -304,6 +325,31 @@ async function sendChat(message) {
     return;
   }
   addMessage("user", message);
+  setChatThinking("Reading your question", "Checking whether you asked about a specific paper section.");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const lowerMessage = message.toLowerCase();
+  const sectionHint = [
+    "abstract",
+    "introduction",
+    "background",
+    "statement of the problem",
+    "sop",
+    "objective",
+    "method",
+    "finding",
+    "result",
+    "discussion",
+    "conclusion",
+    "reference",
+  ].some((term) => lowerMessage.includes(term));
+  setChatThinking(
+    sectionHint ? "Finding the matching section" : "Loading review context",
+    sectionHint
+      ? "Looking through the analyzed draft so the answer can focus on that section."
+      : "Using the latest analysis, stored issues, and paper text for context."
+  );
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  setChatThinking("Asking the model", `Sending the focused request to ${selectedModel()}.`);
   const data = await apiJson("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -314,6 +360,20 @@ async function sendChat(message) {
       format_mode: selectedFormat(),
     }),
   });
+  if (data.context?.focused_section_found) {
+    setChatThinking(
+      "Section found",
+      `The agent is answering with focus on ${data.context.focused_section || "the selected section"}.`
+    );
+    await new Promise((resolve) => setTimeout(resolve, 160));
+  } else if (data.context?.focused_section) {
+    setChatThinking(
+      "Section not found",
+      `The agent looked for ${data.context.focused_section}, but it was not found in the analyzed draft.`
+    );
+    await new Promise((resolve) => setTimeout(resolve, 160));
+  }
+  clearChatThinking();
   addMessage("agent", data.next_prompt);
   if (data.context?.focused_section_found && data.context.focused_section_text) {
     chatFocusHighlight = {
@@ -601,6 +661,7 @@ chatForm.addEventListener("submit", async (event) => {
   try {
     await sendChat(message);
   } catch (error) {
+    clearChatThinking();
     stopThinking();
     addMessage("agent", error.message, true);
   }

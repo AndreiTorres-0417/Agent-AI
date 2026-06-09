@@ -230,6 +230,31 @@ h3 {
   color: var(--danger);
 }
 
+.message.chat-thinking {
+  border-color: rgba(71, 192, 141, 0.32);
+  background: rgba(71, 192, 141, 0.08);
+  color: var(--muted);
+}
+
+.chat-thinking-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.chat-thinking-step::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: chat-pulse 0.9s ease-in-out infinite;
+}
+
 .message p {
   margin: 0 0 9px;
 }
@@ -445,6 +470,19 @@ textarea:focus {
   50% {
     height: 28px;
     opacity: 1;
+  }
+}
+
+@keyframes chat-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
   }
 }
 

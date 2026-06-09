@@ -214,20 +214,85 @@ user's specific request cannot be answered without clarification. Do not use emo
 
 
 SECTION_ALIASES = {
-    "abstract": ["abstract"],
+    "title": ["title", "paper title", "research title"],
+    "abstract": ["abstract", "executive summary", "summary"],
+    "keywords": ["keywords", "key words", "index terms"],
     "introduction": ["introduction", "intro"],
-    "literature review": ["literature review", "related work", "background"],
-    "methodology": ["methodology", "methods", "method", "materials and methods"],
-    "results": ["results", "findings"],
-    "discussion": ["discussion"],
-    "conclusion": ["conclusion", "conclusions"],
-    "references": ["references", "reference list", "bibliography", "works cited"],
+    "background": ["background", "background of the study", "context of the study"],
+    "rationale": ["rationale", "rationale of the study", "research rationale"],
+    "statement of the problem": [
+        "statement of the problem",
+        "statement of problem",
+        "sop",
+        "problem statement",
+        "research problem",
+    ],
+    "research questions": ["research questions", "research question", "guide questions", "study questions"],
+    "objectives of the study": [
+        "objectives of the study",
+        "objectives",
+        "research objectives",
+        "general objective",
+        "specific objectives",
+        "aims and objectives",
+    ],
+    "hypothesis": ["hypothesis", "hypotheses", "research hypothesis", "research hypotheses"],
+    "significance of the study": [
+        "significance of the study",
+        "significance",
+        "importance of the study",
+        "benefits of the study",
+    ],
+    "scope and delimitation": [
+        "scope and delimitation",
+        "scope and delimitations",
+        "scope of the study",
+        "delimitation of the study",
+        "delimitations of the study",
+    ],
+    "limitations": ["limitations", "limitations of the study", "study limitations"],
+    "definition of terms": ["definition of terms", "terms and definitions", "operational definition of terms"],
+    "literature review": [
+        "literature review",
+        "review of related literature",
+        "review of related studies",
+        "related literature",
+        "related studies",
+        "related work",
+        "prior work",
+    ],
+    "theoretical framework": ["theoretical framework", "theory framework"],
+    "conceptual framework": ["conceptual framework", "conceptual model", "research framework"],
+    "methodology": [
+        "methodology",
+        "research methodology",
+        "methods",
+        "method",
+        "materials and methods",
+        "research design and methodology",
+    ],
+    "research design": ["research design", "study design"],
+    "participants": ["participants", "respondents", "subjects", "sample", "population and sample"],
+    "instruments": ["instruments", "research instruments", "materials", "measures"],
+    "data collection": ["data collection", "data gathering", "data gathering procedure", "procedure"],
+    "data analysis": ["data analysis", "statistical treatment", "analysis of data"],
+    "ethical considerations": ["ethical considerations", "ethics", "research ethics"],
+    "results": ["results", "findings", "results and findings"],
+    "discussion": ["discussion", "analysis and discussion"],
+    "results and discussion": ["results and discussion", "findings and discussion"],
+    "recommendations": ["recommendations", "recommendation", "future recommendations"],
+    "future work": ["future work", "future research", "future studies", "directions for future research"],
+    "conclusion": ["conclusion", "conclusions", "summary and conclusion"],
+    "acknowledgment": ["acknowledgment", "acknowledgement", "acknowledgments", "acknowledgements"],
+    "appendix": ["appendix", "appendices", "appendix a", "appendix b"],
+    "references": ["references", "reference list", "bibliography", "works cited", "sources"],
 }
 
 
 def normalize_section_title(title: str) -> str:
     cleaned = re.sub(r"^\s*#{1,6}\s*", "", title).strip()
     cleaned = re.sub(r"^(?:[IVXLC]+|\d+)\.\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*\([A-Za-z0-9\s.-]{1,20}\)\s*$", "", cleaned).strip()
     return re.sub(r"\s+", " ", cleaned).lower()
 
 
@@ -1380,6 +1445,16 @@ def deterministic_findings(text: str, format_mode: str = "ieee") -> Dict[str, Li
                 "Add the missing numbered entries or correct the in-text citation numbers.",
                 severity="high",
             )
+        unused_references = sorted(set(reference_numbers) - set(body_citation_numbers))
+        if unused_references:
+            add_issue(
+                citation_issues,
+                "IEEE reference entries are not cited in the paper body",
+                f"Reference entries {unused_references} appear in the References section but are not used as in-text citations.",
+                "Cite each listed reference in the body or remove unused reference entries.",
+                f"[{unused_references[0]}]",
+                "high",
+            )
 
     for item in (citation_issues + structure_issues)[:5]:
         suggestions.append(
@@ -1562,6 +1637,15 @@ def merge_academic_safety_findings(data: Dict[str, Any], text: str) -> Dict[str,
                 f"In-text citation numbers {missing} do not have matching numbered entries in the References section.",
                 "Add the missing source metadata or remove unsupported citation markers.",
                 f"[{missing[0]}]",
+            )
+        unused_references = sorted(reference_numbers - set(body_bracket_numbers))
+        if unused_references:
+            add_citation_issue(
+                "Reference entries are not cited in the paper body",
+                "high",
+                f"Reference entries {unused_references} appear in the References section but are never cited before the References heading.",
+                "Cite each listed reference in the body where it supports a claim, or remove unused entries from the References section.",
+                f"[{unused_references[0]}]",
             )
         if incomplete_ref:
             add_citation_issue(
